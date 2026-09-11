@@ -15,6 +15,7 @@ Run the latest state-of-the-art generative image models locally on your Mac in n
 - [💿 Installation](#-installation)
 - [🎨 Models](#-models)
 - [✨ Features](#-features)
+- [🦄 Contributors](#-contributors)
 - [🌱 Related projects](#related-projects)
 - [🙏 Acknowledgements](#-acknowledgements)
 - [⚖️ License](#%EF%B8%8F-license)
@@ -155,6 +156,18 @@ See the [common README](src/mflux/models/common/README.md) for detailed usage an
 > [!NOTE]
 > As MFLUX supports a wide variety of CLI tools and options, the easiest way to navigate the CLI in 2026 is to use a coding agent (like [Cursor](https://cursor.com), [Claude Code](https://www.anthropic.com/claude-code), or similar). Ask questions like: “Can you help me generate an image using z-image?”
 
+
+
+
+---
+
+<a id="contributors"></a>
+
+### 🦄 Contributors
+
+<img src="https://contrib.rocks/image?repo=mflux-community/mflux" />
+
+MFlux was originally created by [Filip Strand](https://github.com/filipstrand)
 
 ---
 
