@@ -106,7 +106,7 @@ mflux-generate-z-image-controlnet \
 
 - `--control type:path[:strength]`, repeatable, so `--control "pose:a.png:0.8" --control "depth:b.png:0.6"` stacks two hints. The strength is the model card's `control_context_scale`: 0.65 to 1.0 is the range where the picture follows the hint, and 1.0 is the default. `--controlnet-strength` is a global multiplier over every control, 1.0 by default; at 0.4 (the FLUX ControlNet's default, and this command's until 0.19.3) a `0.85` control came out at 0.34 and the composition ignored the hint.
 - Width and height are rounded down to multiples of 16, and the control picture is resized to that size, so ask for 640 x 368 rather than 638 x 367 and the hint lines up with the output.
-- The 2.1 checkpoint lost part of Turbo's distillation in training, which the model card says outright: at 6 steps the result is soft, at about 20 it is clean. The card also lists 8-step distilled variants of the same ControlNet (`...-Union-2.1-8steps`, `...-2601-8steps`), which this command can load from a repo or path carrying the file.
+- The 2.1 checkpoint lost part of Turbo's distillation in training, which the model card says outright: at 6 steps the result is soft, at about 20 it is clean. The card also lists 8-step distilled variants of the same ControlNet (`...-Union-2.1-8steps`, `...-2601-8steps`); this command loads the 2.1 file, and the only way to run another one today is a model directory saved with `mflux-save` whose `controlnet/` holds that file and its config.
 - `--model` defaults to `z-image-controlnet`, the Turbo transformer plus the Union checkpoint; a local directory saved with `mflux-save` from that model works the same.
 
 <details>
