@@ -89,6 +89,47 @@ image.save("z_image_turbo.png")
 > [!WARNING]
 > Note: Z-Image weights are large (~31GB). Use quantization for smaller sizes.
 
+## Z-Image Turbo ControlNet (Union 2.1)
+
+`mflux-generate-z-image-controlnet` runs Z-Image-Turbo with the [Fun ControlNet Union 2.1](https://huggingface.co/alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1) from Alibaba PAI. One checkpoint takes five kinds of hint, and every hint is computed locally from an ordinary picture: `canny` and `mlsd` with OpenCV, `depth` with DepthPro, `hed` and `pose` with native MLX detectors (the detector weights download on first use). Give the picture, not a pre-drawn edge map:
+
+```sh
+mflux-generate-z-image-controlnet \
+  --prompt "a white marble statue of a girl holding a frog, museum lighting" \
+  --control "canny:photo.png:0.85" \
+  --width 640 \
+  --height 368 \
+  --steps 20 \
+  --seed 3 \
+  -q 8
+```
+
+- `--control type:path[:strength]`, repeatable, so `--control "pose:a.png:0.8" --control "depth:b.png:0.6"` stacks two hints. The strength is the model card's `control_context_scale`: 0.65 to 1.0 is the range where the picture follows the hint, and 1.0 is the default. `--controlnet-strength` is a global multiplier over every control, 1.0 by default; at 0.4 (the FLUX ControlNet's default, and this command's until 0.19.3) a `0.85` control came out at 0.34 and the composition ignored the hint.
+- Width and height are rounded down to multiples of 16, and the control picture is resized to that size, so ask for 640 x 368 rather than 638 x 367 and the hint lines up with the output.
+- The 2.1 checkpoint lost part of Turbo's distillation in training, which the model card says outright: at 6 steps the result is soft, at about 20 it is clean. The card also lists 8-step distilled variants of the same ControlNet (`...-Union-2.1-8steps`, `...-2601-8steps`), which this command can load from a repo or path carrying the file.
+- `--model` defaults to `z-image-controlnet`, the Turbo transformer plus the Union checkpoint; a local directory saved with `mflux-save` from that model works the same.
+
+<details>
+<summary>Python API (ControlNet)</summary>
+
+```python
+from mflux.models.z_image.variants.controlnet.control_types import ControlSpec, ControlType
+from mflux.models.z_image.variants.controlnet.z_image_turbo_controlnet import ZImageTurboControlnet
+
+model = ZImageTurboControlnet(quantize=8)
+image = model.generate_image(
+    seed=3,
+    prompt="a white marble statue of a girl holding a frog, museum lighting",
+    controls=[ControlSpec(type=ControlType.canny, image_path="photo.png", strength=0.85)],
+    controlnet_strength=1.0,  # the API's own default is 0.8
+    num_inference_steps=20,
+    width=640,
+    height=368,
+)
+image.save("statue.png")
+```
+</details>
+
 ## Training
 
 Use `mflux-train` with a training config that targets `z-image` or `z-image-turbo`. We automatically load the Z-Image Turbo training adapter ([ostris/zimage_turbo_training_adapter](https://huggingface.co/ostris/zimage_turbo_training_adapter)) only when training the turbo model; base Z-Image training does not use the assistant LoRA. You can start from the [example config](../common/training/_example/train.json). For the data/images folder layout, see the common training docs ([Training (LoRA)](../common/README.md#training-lora)).

@@ -6,6 +6,9 @@ import platformdirs
 
 BATTERY_PERCENTAGE_STOP_LIMIT = 5
 CONTROLNET_STRENGTH = 0.4
+# Union ControlNets (Z-Image): the per-control strength in --control is the model card's
+# control_context_scale (0.65 to 1.0 recommended); the global multiplier is a no-op by default.
+UNION_CONTROLNET_STRENGTH = 1.0
 DEFAULT_DEV_FILL_GUIDANCE = 30
 DEFAULT_DEPTH_GUIDANCE = 10
 DIMENSION_STEP_PIXELS = 16

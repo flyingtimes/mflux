@@ -273,13 +273,16 @@ class CommandLineParser(argparse.ArgumentParser):
             "--control",
             action="append",
             required=require_controls,
-            help="Repeatable control spec: type:path[:strength] (e.g. pose:pose.png:0.8).",
+            help="Repeatable control spec: type:path[:strength] (e.g. pose:pose.png:0.8). The strength is the model card's control_context_scale; 0.65 to 1.0 is the recommended range, default 1.0.",
         )
+        # 1.0, not the FLUX ControlNet's 0.4: the effective scale is this multiplier times the
+        # per-control strength, and 0.4 x 0.85 = 0.34 sits below the range where the Union
+        # ControlNet follows its hint at all (#721).
         self.add_argument(
             "--controlnet-strength",
             type=finite_float,
-            default=ui_defaults.CONTROLNET_STRENGTH,
-            help=f"Global multiplier applied to all controls. (Default is {ui_defaults.CONTROLNET_STRENGTH})",
+            default=ui_defaults.UNION_CONTROLNET_STRENGTH,
+            help=f"Global multiplier applied to every control's strength. (Default is {ui_defaults.UNION_CONTROLNET_STRENGTH}, so each control's own strength is the effective scale)",
         )
 
     def add_concept_attention_arguments(self) -> None:
