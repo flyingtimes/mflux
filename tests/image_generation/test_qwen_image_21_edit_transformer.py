@@ -1,0 +1,72 @@
+import mlx.core as mx
+import numpy as np
+import pytest
+
+from mflux.models.common.config import ModelConfig
+from mflux.models.common.config.config import Config
+from mflux.models.qwen21.model.qwen21_text_encoder.qwen21_text_encoder import build_mrope_positions
+from mflux.models.qwen21.model.qwen21_transformer.qwen21_transformer import Qwen21Transformer
+
+
+@pytest.mark.fast
+def test_build_mrope_positions_matches_reference_layout() -> None:
+    # tokens: 3 text, 6 image (2x3 merged grid), 2 text
+    input_ids = mx.zeros((1, 11), dtype=mx.int32)
+    image_mask = mx.array([[False] * 3 + [True] * 6 + [False] * 2])
+    grid_thw = mx.array([[1, 4, 6]])  # pre-merge grid; merged 2x3
+
+    positions = np.array(build_mrope_positions(input_ids, image_mask, grid_thw))
+
+    expected = np.zeros((3, 11), dtype=np.int32)
+    expected[:, :3] = np.arange(3)[None, :]
+    # image tokens: t = 3, h = 3..4, w = 3..5 (h-major), then the ladder continues at 3 + max(2, 3)
+    t = np.full(6, 3)
+    h = np.repeat(np.arange(3, 5), 3)
+    w = np.tile(np.arange(3, 6), 2)
+    expected[:, 3:9] = np.stack([t, h, w])
+    expected[:, 9:] = np.arange(6, 8)[None, :]
+    np.testing.assert_array_equal(positions, expected)
+
+
+@pytest.mark.fast
+def test_edit_mask_separates_text_causal_from_image_blocks() -> None:
+    transformer = Qwen21Transformer(num_layers=1)
+    layout = [
+        ("text", mx.zeros((1, 2, 8))),
+        ("image", mx.zeros((1, 4, 8)), (2, 2)),
+        ("text", mx.zeros((1, 3, 8))),
+    ]
+    mask = np.array(transformer._edit_geometry(layout, target_height=2, target_width=2)[0, 0].astype(mx.float32))
+    assert mask.shape == (13, 13)  # 2 text + 4 ref + 3 text + 4 target
+
+    # query rows are text (never attend future text), reference rows attend their whole
+    # block, target rows attend everything
+    assert mask[1, 0] == 0.0 and mask[0, 1] != 0.0  # text: causal only
+    assert mask[2, 5] == 0.0 and mask[5, 2] == 0.0  # one reference block: bidirectional
+    assert mask[2, 6] != 0.0 and mask[6, 2] == 0.0  # ref -> later text: no; later text -> ref: yes
+    assert mask[0, 9] != 0.0 and mask[9, 0] == 0.0  # target keys invisible to text, and vice versa
+    assert mask[9, 12] == 0.0  # target block: bidirectional
+
+
+@pytest.mark.fast
+def test_edit_path_matches_t2i_path_without_condition_images() -> None:
+    # Without reference images the edit forward must be exactly the validated t2i forward.
+    transformer = Qwen21Transformer(num_layers=2)
+    config = Config(
+        width=64,
+        height=64,
+        guidance=1.0,
+        scheduler="linear",
+        image_path=None,
+        image_strength=None,
+        model_config=ModelConfig.qwen_image_21(),
+        num_inference_steps=4,
+    )
+    rng = np.random.default_rng(7)
+    text = mx.array(rng.standard_normal((1, 12, 4096)).astype(np.float32)).astype(mx.bfloat16)
+    latents = mx.array(rng.standard_normal((1, 16, 64)).astype(np.float32)).astype(mx.bfloat16)
+
+    out_t2i = transformer(t=0, config=config, hidden_states=latents, encoder_hidden_states=text)
+    out_edit = transformer.__call_edit__(t=0, config=config, target_latents=latents, layout=[("text", text)])
+
+    np.testing.assert_array_equal(np.array(out_t2i.astype(mx.float32)), np.array(out_edit.astype(mx.float32)))

@@ -24,7 +24,10 @@ class Qwen21Attention(nn.Module):
         rope_sin: mx.array,
         attn_mask: mx.array | None,
         text_len: int | None = None,
-    ) -> mx.array:
+        kv_pair: tuple[mx.array, mx.array] | None = None,
+        kv_mode: str | None = None,
+        prefix_len: int = 0,
+    ) -> mx.array | tuple[mx.array, tuple[mx.array, mx.array]]:
         query = mx.reshape(self.to_q(hidden_states), (*hidden_states.shape[:-1], self.num_heads, self.head_dim))
         key = mx.reshape(self.to_k(hidden_states), (*hidden_states.shape[:-1], self.num_heads, self.head_dim))
         value = mx.reshape(self.to_v(hidden_states), (*hidden_states.shape[:-1], self.num_heads, self.head_dim))
@@ -38,6 +41,32 @@ class Qwen21Attention(nn.Module):
         query = mx.transpose(query, (0, 2, 1, 3))
         key = mx.transpose(key, (0, 2, 1, 3))
         value = mx.transpose(value, (0, 2, 1, 3))
+
+        if kv_mode == "extract":
+            # first step: full prefill with the block-causal mask; store the prefix
+            # (text + reference) K/V -- causal_condition keeps them step-independent
+            attn_out = scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                scale=self.head_dim**-0.5,
+                mask=attn_mask,
+            )
+            prefix_kv = (key[:, :, :prefix_len], value[:, :, :prefix_len])
+            return self._merge(attn_out), prefix_kv
+
+        if kv_mode == "cached":
+            # later steps: only target queries are recomputed; they attend the frozen
+            # prefix K/V from the cache plus their own tokens -- full attention, no mask
+            key = mx.concatenate([kv_pair[0], key], axis=2)
+            value = mx.concatenate([kv_pair[1], value], axis=2)
+            attn_out = scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                scale=self.head_dim**-0.5,
+            )
+            return self._merge(attn_out), kv_pair
 
         if text_len is not None and attn_mask is None:
             # block-causal, segmented like the reference processor: causal text attention
@@ -64,7 +93,10 @@ class Qwen21Attention(nn.Module):
                 scale=self.head_dim**-0.5,
                 mask=attn_mask,
             )
-        hidden_states = mx.transpose(hidden_states, (0, 2, 1, 3))
+        return self._merge(hidden_states)
+
+    def _merge(self, attn_out: mx.array) -> mx.array:
+        hidden_states = mx.transpose(attn_out, (0, 2, 1, 3))
         hidden_states = mx.reshape(hidden_states, (*hidden_states.shape[:-2], self.num_heads * self.head_dim))
         return self.to_out[0](hidden_states)
 

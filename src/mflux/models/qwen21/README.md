@@ -74,6 +74,43 @@ mflux-generate-qwen-2.1 --prompt "..." --negative-prompt "blurry, low quality" -
 
 With no negative prompt (or `--guidance 1.0`, the default) the negative pass is skipped entirely.
 
+### Editing
+
+Qwen Image 2.1 is a unified generation + editing model: editing is the same pipeline with one
+or more condition images. The Qwen3-VL text encoder reads each condition image as vision
+context (its vision tower ships inside the `text_encoder` shards, so no extra download is
+needed) while the VAE encodes it into latent tokens prepended to the noise sequence.
+
+```sh
+mflux-generate-qwen-2.1-edit \
+  --image-path input.png \
+  --prompt "Change the background to a sunset beach" \
+  --steps 40 \
+  --seed 42
+```
+
+Multiple condition images are referenced as `Image 1`, `Image 2`, ... in the prompt:
+
+```sh
+mflux-generate-qwen-2.1-edit \
+  --image-paths photo1.png photo2.png \
+  --prompt "Put the person from Image 1 into the scene from Image 2" \
+  --steps 40
+```
+
+RGBA condition images keep their alpha for the VAE (edit masks); the vision encoder sees a
+white-composited copy. Output dimensions default to the last condition image's aspect ratio
+at ~1MP unless `--width`/`--height` are given.
+
+### Prefix KV cache
+
+Editing steps after the first only recompute the target-image queries: because
+`causal_condition` modulates text and reference tokens from `t = 0`, their activations are
+step-independent, so the first step prefills a per-layer K/V cache of the text + reference
+prefix and later steps attend it. `QwenImage21Edit.generate_image(..., use_kv_cache=True)`
+(enabled by default) measured 3.6x faster on a three-reference 1024² edit (28 -> 7.7 s/step
+on M2 Ultra bf16) with pixel-identical output against the uncached path.
+
 ### img2img
 
 Pass `--image-path` and optionally `--image-strength`, like the other models.
@@ -90,7 +127,8 @@ Pass `--image-path` and optionally `--image-strength`, like the other models.
   not mapped or loaded.
 - The prompt template is a raw string (not `apply_chat_template`) with the system-role tokens
   dropped from the final hidden states, matching the reference pipeline exactly.
-- The text prefix KV cache (valid because `causal_condition` makes text activations
-  step-independent) is a planned optimization; the current port recomputes the prefix each step.
-- Not yet supported: the edit/instruction variant (needs the Qwen3-VL vision tower), LoRA
-  mappings, and PID decoding.
+- The prefix KV cache (valid because `causal_condition` makes text and reference activations
+  step-independent) is implemented for the edit path: the first step prefills a per-layer
+  K/V cache of the text + reference prefix and later steps recompute only the target queries.
+  The t2i path still recomputes the prefix each step.
+- Not yet supported: LoRA mappings, and PID decoding.
