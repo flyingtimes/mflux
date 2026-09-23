@@ -29,23 +29,30 @@ def test_build_mrope_positions_matches_reference_layout() -> None:
 
 
 @pytest.mark.fast
-def test_edit_mask_separates_text_causal_from_image_blocks() -> None:
+def test_edit_segments_separate_text_causal_from_image_blocks() -> None:
     transformer = Qwen21Transformer(num_layers=1)
     layout = [
         ("text", mx.zeros((1, 2, 8))),
         ("image", mx.zeros((1, 4, 8)), (2, 2)),
         ("text", mx.zeros((1, 3, 8))),
     ]
-    mask = np.array(transformer._edit_geometry(layout, target_height=2, target_width=2)[0, 0].astype(mx.float32))
-    assert mask.shape == (13, 13)  # 2 text + 4 ref + 3 text + 4 target
+    segments = transformer._edit_segments(layout, target_height=2, target_width=2)
 
-    # query rows are text (never attend future text), reference rows attend their whole
-    # block, target rows attend everything
-    assert mask[1, 0] == 0.0 and mask[0, 1] != 0.0  # text: causal only
-    assert mask[2, 5] == 0.0 and mask[5, 2] == 0.0  # one reference block: bidirectional
-    assert mask[2, 6] != 0.0 and mask[6, 2] == 0.0  # ref -> later text: no; later text -> ref: yes
-    assert mask[0, 9] != 0.0 and mask[9, 0] == 0.0  # target keys invisible to text, and vice versa
-    assert mask[9, 12] == 0.0  # target block: bidirectional
+    # runs in template order, target block appended: text 2, image 4, text 3, target 4
+    assert [(s, e) for s, e, _, _ in segments] == [(0, 2), (2, 6), (6, 9), (9, 13)]
+    assert [is_text for _, _, is_text, _ in segments] == [True, False, True, False]
+
+    # text runs carry a causal-over-their-whole-prefix mask; image runs are unmasked
+    first_text_mask = np.array(segments[0][3][0, 0].astype(mx.float32))
+    r, c = np.indices(first_text_mask.shape)
+    assert np.all(first_text_mask[c <= r] == 0.0) and np.all(first_text_mask[c > r] < 0.0)  # causal
+    assert segments[1][3] is None and segments[3][3] is None
+
+    last_text_mask = np.array(segments[2][3][0, 0].astype(mx.float32))
+    assert last_text_mask.shape == (3, 9)  # prefix = 2 + 4 + 3
+    # later text attends the earlier reference block, earlier text never attends later text
+    assert last_text_mask[0, :6].tolist() == [0.0] * 6
+    assert last_text_mask[:, 7:].sum() < 0.0  # future text keys masked
 
 
 @pytest.mark.fast

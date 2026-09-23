@@ -163,11 +163,11 @@ class Qwen21Transformer(nn.Module):
         cached = kv_cache_mode == "cached" and kv_cache is not None
 
         rope_cos, rope_sin = self.pos_embed.__call_edit__(layout, target_height, target_width)
+        segments = self._edit_segments(layout, target_height, target_width)
         if cached:
             # target queries attend everything; only their own rope positions are needed
             rope_cos = rope_cos[prefix_tokens:]
             rope_sin = rope_sin[prefix_tokens:]
-            attn_mask = None
             temb = self.time_text_embed(timestep)  # (1, dim): only the sampled-t row
             mod1, mod2 = mx.split(self.modulation(temb), 2, axis=-1)
             mod1 = mx.broadcast_to(mod1[:, None, :], (1, target_tokens, mod1.shape[-1]))
@@ -191,7 +191,6 @@ class Qwen21Transformer(nn.Module):
             return self.proj_out(self.norm_out(hidden_states, scale))
 
         timestep_rows = mx.concatenate([timestep, mx.zeros((1,), dtype=timestep.dtype)])
-        attn_mask = self._edit_geometry(layout, target_height, target_width)
         if kv_cache_mode == "extract":
             # runs once per generation -- compile gains nothing, and the kv list must
             # not enter the compiled graph
@@ -201,7 +200,7 @@ class Qwen21Transformer(nn.Module):
                 timestep_rows,
                 rope_cos,
                 rope_sin,
-                attn_mask,
+                segments,
                 prefix_tokens,
                 kv_cache,
             )
@@ -216,45 +215,38 @@ class Qwen21Transformer(nn.Module):
             timestep_rows,
             rope_cos,
             rope_sin,
-            attn_mask,
+            segments,
             prefix_tokens,
             None,
         )
         return out
 
-    def _edit_geometry(self, layout: list[tuple], target_height: int, target_width: int) -> mx.array:
-        # Built per call and deliberately not cached: at multi-reference resolutions the
-        # additive mask alone is hundreds of MB, and the cached decode path never needs it.
-        lengths = []
-        block_ids: list[np.ndarray] = []
-        next_image_id = 0
+    def _edit_segments(
+        self, layout: list[tuple], target_height: int, target_width: int
+    ) -> list[tuple[int, int, bool, mx.array | None]]:
+        # Exact multi-pass prefill plan, one entry per run: a text run attends its whole
+        # prefix causally (small additive mask), an image run attends its whole prefix
+        # unmasked. Avoids materializing any quadratic dense mask tensor. The target
+        # block is appended last with a full-attention entry.
+        segments: list[tuple[int, int, bool, mx.array | None]] = []
+        start = 0
         for run in layout:
             if run[0] == "text":
                 n = run[1].shape[1]
-                lengths.append(n)
-                # text tokens get no block id: they attend purely causally, exactly
-                # like the reference (only image blocks are bidirectional)
-                block_ids.append(np.full(n, -1, dtype=np.int32))
+                seg_mask = None
+                if n > 1:
+                    small = np.full((n, start + n), -1e9, dtype=np.float32)
+                    for i in range(n):
+                        small[i, : start + i + 1] = 0.0
+                    seg_mask = mx.array(small).astype(ModelConfig.precision)[None, None]
+                segments.append((start, start + n, True, seg_mask))
+                start += n
             else:
                 _, _, (h, w) = run
-                n = h * w
-                lengths.append(n)
-                block_ids.append(np.full(n, next_image_id, dtype=np.int32))
-                next_image_id += 1
-        target_tokens = target_height * target_width
-        lengths.append(target_tokens)
-        block_ids.append(np.full(target_tokens, next_image_id, dtype=np.int32))
-
-        seq_len = sum(lengths)
-        block_ids_arr = np.concatenate(block_ids)
-        idx = np.arange(seq_len)
-        # image blocks are internally bidirectional; text tokens (id -1) stay purely
-        # causal, so same-block only applies to ids >= 0
-        same_block = (block_ids_arr[None, :] == block_ids_arr[:, None]) & (block_ids_arr[None, :] >= 0)
-        # block-causal: each query attends every key at or before it, plus its own
-        # image block
-        causal = (idx[None, :] <= idx[:, None]) | same_block
-        return mx.where(mx.array(causal), 0.0, -1e9).astype(ModelConfig.precision)[None, None, :, :]
+                segments.append((start, start + h * w, False, None))
+                start += h * w
+        segments.append((start, start + target_height * target_width, False, None))
+        return segments
 
     def _forward_edit(
         self,
@@ -263,7 +255,7 @@ class Qwen21Transformer(nn.Module):
         timestep_rows: mx.array,
         rope_cos: mx.array,
         rope_sin: mx.array,
-        attn_mask: mx.array,
+        segments: list[tuple[int, int, bool, mx.array | None]],
         prefix_tokens: int = 0,
         kv_cache: list | None = None,
     ) -> tuple[mx.array, list]:
@@ -291,7 +283,9 @@ class Qwen21Transformer(nn.Module):
         prefix_kv = []
         for index_block, block in enumerate(self.transformer_blocks):
             pair = kv_cache[index_block] if kv_cache is not None else None
-            out = block(hidden_states, mod1, mod2, rope_cos, rope_sin, attn_mask, None, pair, kv_mode, prefix_tokens)
+            out = block(
+                hidden_states, mod1, mod2, rope_cos, rope_sin, None, None, pair, kv_mode, prefix_tokens, segments
+            )
             if kv_mode is not None:
                 hidden_states, pair = out
                 prefix_kv.append(pair)

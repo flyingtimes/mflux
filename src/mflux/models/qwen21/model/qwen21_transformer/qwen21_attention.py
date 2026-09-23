@@ -27,6 +27,7 @@ class Qwen21Attention(nn.Module):
         kv_pair: tuple[mx.array, mx.array] | None = None,
         kv_mode: str | None = None,
         prefix_len: int = 0,
+        segments: list[tuple[int, int, bool, mx.array | None]] | None = None,
     ) -> mx.array | tuple[mx.array, tuple[mx.array, mx.array]]:
         query = mx.reshape(self.to_q(hidden_states), (*hidden_states.shape[:-1], self.num_heads, self.head_dim))
         key = mx.reshape(self.to_k(hidden_states), (*hidden_states.shape[:-1], self.num_heads, self.head_dim))
@@ -42,9 +43,30 @@ class Qwen21Attention(nn.Module):
         key = mx.transpose(key, (0, 2, 1, 3))
         value = mx.transpose(value, (0, 2, 1, 3))
 
+        if segments is not None:
+            # exact multi-pass prefill, one call per run: a text run attends its whole
+            # prefix causally (small additive mask), an image run attends its whole
+            # prefix unmasked. Avoids any quadratic dense mask tensor.
+            out_parts = []
+            for start, end, is_text, seg_mask in segments:
+                out_parts.append(
+                    scaled_dot_product_attention(
+                        query[:, :, start:end],
+                        key[:, :, :end],
+                        value[:, :, :end],
+                        scale=self.head_dim**-0.5,
+                        mask=seg_mask,
+                    )
+                )
+            attn_out = self._merge(mx.concatenate(out_parts, axis=2))
+            if kv_mode == "extract":
+                prefix_kv = (key[:, :, :prefix_len], value[:, :, :prefix_len])
+                return attn_out, prefix_kv
+            return attn_out
+
         if kv_mode == "extract":
-            # first step: full prefill with the block-causal mask; store the prefix
-            # (text + reference) K/V -- causal_condition keeps them step-independent
+            # dense-mask fallback; store the prefix (text + reference) K/V --
+            # causal_condition keeps them step-independent
             attn_out = scaled_dot_product_attention(
                 query,
                 key,
