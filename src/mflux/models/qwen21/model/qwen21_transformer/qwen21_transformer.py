@@ -147,26 +147,15 @@ class Qwen21Transformer(nn.Module):
         kv_cache: list | None = None,
         kv_cache_mode: str | None = None,
     ) -> mx.array:
-        """Edit forward over the reference joint sequence.
-
-        layout: template-ordered runs, each ('text', embeds (1, n, 4096)) for a text run
-        or ('image', latents (1, h*w, 64), (h, w)) for one condition image's latent block;
-        the target image is appended after the last run. This mirrors the reference, where
-        condition-image latents are substituted into the VLM text stream at the expanded
-        <|image_pad|> slots and the target latents are appended.
-
-        Text runs are purely causal (a text token never attends to a later text token),
-        every image block attends internally bidirectionally, and everything before a
-        token is visible to it (block-causal). Non-target tokens are modulated from t=0
-        (causal_condition). Only the target tokens are returned.
-
-        Prefix KV cache (the official optimization): because causal_condition modulates
-        text and reference tokens from t=0, their activations are step-independent. Pass
-        a mutable kv_cache list (one slot per block, initialized to None) together with
-        kv_cache_mode="extract" on the first denoising step (full prefill; prefix K/V
-        stored) and "cached" on later steps (only target queries recomputed, attending
-        cache + own tokens).
-        """
+        # layout: template-ordered runs, each ('text', embeds (1, n, 4096)) or
+        # ('image', latents (1, h*w, 64), (h, w)) for one condition image; the target
+        # block is appended after the last run. Text runs are purely causal, image
+        # blocks bidirectional (block-causal), non-target tokens modulated from t=0
+        # (causal_condition); only target tokens are returned.
+        #
+        # kv_cache/kv_cache_mode enable the prefix KV cache: "extract" prefills a
+        # per-layer K/V cache of the text+reference prefix, "cached" recomputes only
+        # target queries against cache + own tokens.
         timestep = Qwen21Transformer._compute_timestep(t, config)
         target_height, target_width = config.height // 16, config.width // 16
         target_tokens = target_height * target_width
@@ -233,49 +222,39 @@ class Qwen21Transformer(nn.Module):
         )
         return out
 
-    def _edit_geometry(
-        self,
-        layout: list[tuple],
-        target_height: int,
-        target_width: int,
-    ) -> mx.array:
-        run_key = tuple(
-            ("text", run[1].shape[1]) if run[0] == "text" else ("image", run[2][0] * run[2][1]) for run in layout
-        )
-        cache_key = ("edit", run_key, target_height, target_width)
-        if cache_key not in self._geometry_cache:
-            lengths = []
-            block_ids: list[np.ndarray] = []
-            next_image_id = 0
-            for run in layout:
-                if run[0] == "text":
-                    n = run[1].shape[1]
-                    lengths.append(n)
-                    # text tokens get no block id: they attend purely causally, exactly
-                    # like the reference (only image blocks are bidirectional)
-                    block_ids.append(np.full(n, -1, dtype=np.int32))
-                else:
-                    _, _, (h, w) = run
-                    n = h * w
-                    lengths.append(n)
-                    block_ids.append(np.full(n, next_image_id, dtype=np.int32))
-                    next_image_id += 1
-            target_tokens = target_height * target_width
-            lengths.append(target_tokens)
-            block_ids.append(np.full(target_tokens, next_image_id, dtype=np.int32))
+    def _edit_geometry(self, layout: list[tuple], target_height: int, target_width: int) -> mx.array:
+        # Built per call and deliberately not cached: at multi-reference resolutions the
+        # additive mask alone is hundreds of MB, and the cached decode path never needs it.
+        lengths = []
+        block_ids: list[np.ndarray] = []
+        next_image_id = 0
+        for run in layout:
+            if run[0] == "text":
+                n = run[1].shape[1]
+                lengths.append(n)
+                # text tokens get no block id: they attend purely causally, exactly
+                # like the reference (only image blocks are bidirectional)
+                block_ids.append(np.full(n, -1, dtype=np.int32))
+            else:
+                _, _, (h, w) = run
+                n = h * w
+                lengths.append(n)
+                block_ids.append(np.full(n, next_image_id, dtype=np.int32))
+                next_image_id += 1
+        target_tokens = target_height * target_width
+        lengths.append(target_tokens)
+        block_ids.append(np.full(target_tokens, next_image_id, dtype=np.int32))
 
-            seq_len = sum(lengths)
-            block_ids_arr = np.concatenate(block_ids)
-            idx = np.arange(seq_len)
-            # image blocks are internally bidirectional; text tokens (id -1) stay purely
-            # causal, so same-block only applies to ids >= 0
-            same_block = (block_ids_arr[None, :] == block_ids_arr[:, None]) & (block_ids_arr[None, :] >= 0)
-            # block-causal: each query attends every key at or before it, plus its own
-            # image block
-            causal = (idx[None, :] <= idx[:, None]) | same_block
-            mask = np.where(causal, 0.0, -1e9).astype(np.float32)
-            self._geometry_cache[cache_key] = mx.array(mask)[None, None, :, :].astype(ModelConfig.precision)
-        return self._geometry_cache[cache_key]
+        seq_len = sum(lengths)
+        block_ids_arr = np.concatenate(block_ids)
+        idx = np.arange(seq_len)
+        # image blocks are internally bidirectional; text tokens (id -1) stay purely
+        # causal, so same-block only applies to ids >= 0
+        same_block = (block_ids_arr[None, :] == block_ids_arr[:, None]) & (block_ids_arr[None, :] >= 0)
+        # block-causal: each query attends every key at or before it, plus its own
+        # image block
+        causal = (idx[None, :] <= idx[:, None]) | same_block
+        return mx.where(mx.array(causal), 0.0, -1e9).astype(ModelConfig.precision)[None, None, :, :]
 
     def _forward_edit(
         self,

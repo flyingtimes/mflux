@@ -8,43 +8,6 @@ from mflux.models.common_models.qwen3_vl.qwen3_vl_rope import Qwen3VLRotaryEmbed
 from mflux.models.common_models.qwen3_vl.qwen3_vl_vision_model import Qwen3VLVisionModel
 
 
-def build_mrope_positions(
-    input_ids: mx.array,
-    image_mask: mx.array,
-    image_grid_thw: mx.array,
-    spatial_merge_size: int = 2,
-) -> mx.array:
-    # Port of transformers Qwen3VL.get_rope_index for a single unpadded sequence:
-    # text runs share a 1D ladder on all three mrope axes; image tokens get 2D
-    # (height, width) positions in merged-grid space and advance the ladder by
-    # max(grid_h, grid_w), matching the reference position bookkeeping.
-    mask = np.array(image_mask[0], dtype=bool)
-    seq_len = mask.shape[0]
-    positions = np.zeros((3, seq_len), dtype=np.int32)
-    grids = [tuple(int(v) for v in grid) for grid in image_grid_thw.tolist()] if image_grid_thw is not None else []
-    grid_index = 0
-    pos = 0
-    i = 0
-    while i < seq_len:
-        if mask[i]:
-            _, grid_h, grid_w = grids[grid_index]
-            grid_index += 1
-            llm_h, llm_w = grid_h // spatial_merge_size, grid_w // spatial_merge_size
-            n = llm_h * llm_w
-            t_axis = np.full(1, pos, dtype=np.int32)  # single frame: temporal position = pos
-            h_axis = np.arange(llm_h, dtype=np.int32) + pos
-            w_axis = np.arange(llm_w, dtype=np.int32) + pos
-            t_grid, h_grid, w_grid = np.meshgrid(t_axis, h_axis, w_axis, indexing="ij")
-            positions[:, i : i + n] = np.stack([t_grid.reshape(-1), h_grid.reshape(-1), w_grid.reshape(-1)])
-            pos += max(llm_h, llm_w)
-            i += n
-        else:
-            positions[:, i] = pos
-            pos += 1
-            i += 1
-    return mx.array(positions)
-
-
 class Qwen21TextEncoder(nn.Module):
     # Qwen3-VL text stack of Qwen-Image-2.1: interleaved mrope, but text-only inputs use
     # one shared position ladder replicated across the three mrope axes.
@@ -140,6 +103,43 @@ class Qwen21TextEncoder(nn.Module):
 
         return self.norm(hidden_states)
 
+    @staticmethod
+    def build_mrope_positions(
+        input_ids: mx.array,
+        image_mask: mx.array,
+        image_grid_thw: mx.array,
+        spatial_merge_size: int = 2,
+    ) -> mx.array:
+        # Port of transformers Qwen3VL.get_rope_index for a single unpadded sequence:
+        # text runs share a 1D ladder on all three mrope axes; image tokens get 2D
+        # (height, width) positions in merged-grid space and advance the ladder by
+        # max(grid_h, grid_w), matching the reference position bookkeeping.
+        mask = np.array(image_mask[0], dtype=bool)
+        seq_len = mask.shape[0]
+        positions = np.zeros((3, seq_len), dtype=np.int32)
+        grids = [tuple(int(v) for v in grid) for grid in image_grid_thw.tolist()] if image_grid_thw is not None else []
+        grid_index = 0
+        pos = 0
+        i = 0
+        while i < seq_len:
+            if mask[i]:
+                _, grid_h, grid_w = grids[grid_index]
+                grid_index += 1
+                llm_h, llm_w = grid_h // spatial_merge_size, grid_w // spatial_merge_size
+                n = llm_h * llm_w
+                t_axis = np.full(1, pos, dtype=np.int32)  # single frame: temporal position = pos
+                h_axis = np.arange(llm_h, dtype=np.int32) + pos
+                w_axis = np.arange(llm_w, dtype=np.int32) + pos
+                t_grid, h_grid, w_grid = np.meshgrid(t_axis, h_axis, w_axis, indexing="ij")
+                positions[:, i : i + n] = np.stack([t_grid.reshape(-1), h_grid.reshape(-1), w_grid.reshape(-1)])
+                pos += max(llm_h, llm_w)
+                i += n
+            else:
+                positions[:, i] = pos
+                pos += 1
+                i += 1
+        return mx.array(positions)
+
     def forward_vl(
         self,
         input_ids: mx.array,
@@ -147,15 +147,10 @@ class Qwen21TextEncoder(nn.Module):
         image_grid_thw: mx.array | None = None,
         image_token_id: int = 151655,
     ) -> tuple[mx.array, mx.array]:
-        """Edit-mode forward: single unpadded sequence, condition-image vision embeds
-        replace the <|image_pad|> positions and deepstack features are added to the
-        hidden states at image positions after the first three decoder layers.
-
-        Returns the hidden states BEFORE the final RMSNorm (what the diffusion
-        transformer was trained on -- transformers' final norm is neutralized by the
-        reference pipeline) plus the per-position image mask (1, seq_len) marking
-        <|image_pad|> positions, both aligned with input_ids.
-        """
+        # Edit-mode forward: vision embeds replace <|image_pad|> positions, deepstack
+        # features inject at image positions after the first three decoder layers, and
+        # the hidden states are returned BEFORE the final RMSNorm (what the diffusion
+        # transformer was trained on). Also returns the (1, seq_len) <|image_pad|> mask.
         if self.visual is None:
             raise RuntimeError("forward_vl requires the vision tower (Qwen21TextEncoder(with_visual=True))")
 
@@ -176,7 +171,7 @@ class Qwen21TextEncoder(nn.Module):
         gathered = image_embeds[gather_index]
         keep = mask_flat[:, None]  # (seq_len, 1)
         hidden_states = mx.where(keep[None, :, :], gathered[None, :, :], hidden_states)
-        positions = build_mrope_positions(input_ids, image_mask, image_grid_thw)
+        positions = Qwen21TextEncoder.build_mrope_positions(input_ids, image_mask, image_grid_thw)
         position_embeddings = self.rotary_emb(hidden_states, positions[:, None, :])  # (3, batch=1, seq)
 
         idx = mx.arange(seq_len, dtype=mx.int32)

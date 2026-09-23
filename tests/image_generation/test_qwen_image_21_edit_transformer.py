@@ -4,7 +4,7 @@ import pytest
 
 from mflux.models.common.config import ModelConfig
 from mflux.models.common.config.config import Config
-from mflux.models.qwen21.model.qwen21_text_encoder.qwen21_text_encoder import build_mrope_positions
+from mflux.models.qwen21.model.qwen21_text_encoder.qwen21_text_encoder import Qwen21TextEncoder
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_transformer import Qwen21Transformer
 
 
@@ -15,7 +15,7 @@ def test_build_mrope_positions_matches_reference_layout() -> None:
     image_mask = mx.array([[False] * 3 + [True] * 6 + [False] * 2])
     grid_thw = mx.array([[1, 4, 6]])  # pre-merge grid; merged 2x3
 
-    positions = np.array(build_mrope_positions(input_ids, image_mask, grid_thw))
+    positions = np.array(Qwen21TextEncoder.build_mrope_positions(input_ids, image_mask, grid_thw))
 
     expected = np.zeros((3, 11), dtype=np.int32)
     expected[:, :3] = np.arange(3)[None, :]

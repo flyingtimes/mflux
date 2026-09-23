@@ -21,13 +21,6 @@ from mflux.utils.generated_image import GeneratedImage
 from mflux.utils.image_util import ImageUtil
 
 
-def _calculate_dimensions(target_area: int, ratio: float) -> tuple[int, int]:
-    # Port of the reference pipeline's calculate_dimensions (multiples of 32).
-    width = (target_area * ratio) ** 0.5
-    height = width / ratio
-    return round(width / 32) * 32, round(height / 32) * 32
-
-
 class QwenImage21Edit(nn.Module):
     vae: Qwen21VAE
     transformer: Qwen21Transformer
@@ -46,6 +39,13 @@ class QwenImage21Edit(nn.Module):
             model_path=model_path,
             model_config=model_config,
         )
+
+    @staticmethod
+    def _calculate_dimensions(target_area: int, ratio: float) -> tuple[int, int]:
+        # Port of the reference pipeline's calculate_dimensions (multiples of 32).
+        width = (target_area * ratio) ** 0.5
+        height = width / ratio
+        return round(width / 32) * 32, round(height / 32) * 32
 
     def generate_image(
         self,
@@ -67,7 +67,7 @@ class QwenImage21Edit(nn.Module):
         # Output size derives from the last condition image's aspect ratio unless given.
         last_ratio = images[-1].size[0] / images[-1].size[1]
         if width is None or height is None:
-            width, height = _calculate_dimensions(output_resolution * output_resolution, last_ratio)
+            width, height = self._calculate_dimensions(output_resolution * output_resolution, last_ratio)
 
         config = Config(
             width=width,
@@ -88,7 +88,7 @@ class QwenImage21Edit(nn.Module):
         ref_shapes: list[tuple[int, int]] = []  # latent-grid (h, w) per image
         for img in images:
             ratio = img.size[0] / img.size[1]
-            w32, h32 = _calculate_dimensions(output_resolution * output_resolution, ratio)
+            w32, h32 = self._calculate_dimensions(output_resolution * output_resolution, ratio)
             resized = img.resize((w32, h32), Image.BICUBIC) if img.size != (w32, h32) else img
             resized_images.append(resized)
             ref_shapes.append((h32 // 16, w32 // 16))
@@ -147,7 +147,6 @@ class QwenImage21Edit(nn.Module):
         # valid because causal_condition keeps text/reference activations step-independent:
         # the first step prefills, later steps recompute only the target queries. The
         # conditional and unconditional passes need separate caches (different embeds).
-        use_kv_cache = True
         kv_cache = [None] * len(self.transformer.transformer_blocks) if use_kv_cache else None
         neg_kv_cache = [None] * len(self.transformer.transformer_blocks) if (use_kv_cache and do_true_cfg) else None
         ctx = self.callbacks.start(seed=seed, prompt=prompt, config=config)
@@ -210,16 +209,14 @@ class QwenImage21Edit(nn.Module):
         tokenizer,
         text_encoder: Qwen21TextEncoder,
     ) -> list[tuple]:
-        """Return the template-ordered run layout: ('text', embeds) / ('image', latents,
-        (h, w)) runs followed implicitly by the target image block the transformer adds.
-
-        The ti2i template is '<system><|im_start|>user\\n<image1><|vision_start|><|image_pad|>
-        <|vision_end|>[prompt]<|im_end|>\\n<|im_start|>assistant' with each <|image_pad|>
-        expanded to the image's merged token count. After dropping the system prefix, the
-        hidden states interleave [user header][image slots][prompt tail]; the layout splits
-        them at the image-slot span and splices the reference latent blocks in place of the
-        slots -- sequence-position equivalent to the reference's slot expansion.
-        """
+        # Returns the template-ordered run layout: ('text', embeds) / ('image', latents,
+        # (h, w)) runs, with the target block added by the transformer. The ti2i template
+        # is '<system><|im_start|>user\n<image1><|vision_start|><|image_pad|><|vision_end|>
+        # [prompt]<|im_end|>\n<|im_start|>assistant' with each <|image_pad|> expanded to
+        # the image's merged token count. After dropping the system prefix, the hidden
+        # states interleave [user header][image slots][prompt tail]; the layout splits
+        # them at the image-slot span and splices the reference latent blocks in place of
+        # the slots -- sequence-position equivalent to the reference's slot expansion.
         if not prompt or not prompt.strip():
             prompt = " "
 

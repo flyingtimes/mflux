@@ -83,7 +83,7 @@ needed) while the VAE encodes it into latent tokens prepended to the noise seque
 
 ```sh
 mflux-generate-qwen-2.1-edit \
-  --image-path input.png \
+  --image-paths input.png \
   --prompt "Change the background to a sunset beach" \
   --steps 40 \
   --seed 42

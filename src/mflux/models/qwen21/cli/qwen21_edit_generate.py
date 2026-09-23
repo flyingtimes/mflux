@@ -47,11 +47,15 @@ def main():
 
     try:
         image_paths = [str(p) for p in args.image_paths]
-        width, height = DimensionResolver.resolve(
-            width=args.width,
-            height=args.height,
-            reference_image_path=image_paths[0],
-        )
+        # "auto" (the parser default) keeps dimensions unresolved so the variant derives
+        # its ~1MP defaults from the last condition image's aspect ratio
+        width = height = None
+        if str(args.width) != "auto" and str(args.height) != "auto":
+            width, height = DimensionResolver.resolve(
+                width=args.width,
+                height=args.height,
+                reference_image_path=image_paths[-1],
+            )
 
         for seed in args.seed:
             image = qwen.generate_image(
