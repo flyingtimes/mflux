@@ -8,28 +8,8 @@ from mflux.models.qwen21.variants.edit.qwen_image_21_edit import QwenImage21Edit
 from mflux.utils.dimension_resolver import DimensionResolver
 from mflux.utils.exceptions import PromptFileReadError, StopImageGenerationException
 from mflux.utils.prompt_util import PromptUtil
-from mflux.utils.scale_factor import ScaleFactor
 
 DEFAULT_MODEL = "qwen-image-2.1"
-
-
-def resolve_output_dimensions(width, height, reference_image_path: str) -> tuple[int | None, int | None]:
-    """Translate CLI dimension flags into generate_image arguments.
-
-    The parser turns the default "auto" into ScaleFactor(1): both dimensions automatic
-    maps to (None, None) so the variant derives its ~1MP target from the last condition
-    image. Explicit scale factors resolve against that same image; plain integers pass
-    through (the variant applies its own /16 rounding).
-    """
-
-    def is_auto(value) -> bool:
-        return isinstance(value, ScaleFactor) and value.value == 1
-
-    if is_auto(width) and is_auto(height):
-        return None, None
-    if isinstance(width, ScaleFactor) or isinstance(height, ScaleFactor):
-        return DimensionResolver.resolve(width=width, height=height, reference_image_path=reference_image_path)
-    return int(width), int(height)
 
 
 def build_parser() -> CommandLineParser:
@@ -67,7 +47,7 @@ def main():
 
     try:
         image_paths = [str(p) for p in args.image_paths]
-        width, height = resolve_output_dimensions(args.width, args.height, image_paths[-1])
+        width, height = DimensionResolver.resolve_output_dimensions(args.width, args.height, image_paths[-1])
 
         for seed in args.seed:
             image = qwen.generate_image(
