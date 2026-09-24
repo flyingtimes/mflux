@@ -141,6 +141,29 @@ previous step's hidden state, with the output norm re-applied to the current tim
 Nearby denoising steps differ little, so most steps skip 31 of 32 blocks; output stays
 close to the baseline but is not pixel-identical. Requires `use_kv_cache=True`.
 
+### Edit strength
+
+`--strength` (Python: `strength=`) in (0, 1] controls how far the edit re-denoises.
+`strength=1.0` (default) starts from pure noise — the fullest reimagining. Lower values
+start partway down the sigma schedule from the reference's own latent noised to that
+sigma, exactly like mflux's img2img: `strength=0.3` runs the last 30% of steps for subtle
+retouching, `0.7` for a strong but composition-preserving change. Composes with inpainting
+masks (the mask still pins unmasked pixels to the original).
+
+### Prompt enhancement and self-verification
+
+The edit model holds a complete Qwen3-VL in memory — including the untied `lm_head` the
+checkpoint ships — so two official-recipe capabilities run with zero extra weights:
+
+- `--enhance-prompt` rewrites a terse instruction into a detailed descriptive prompt
+  before encoding, following the official `prompt_rewrite` serving recipe
+  (QwenLM/Qwen-Image-2.1). The reply is parsed for `{"rewritten_prompt": ...}`; on any
+  failure the original instruction is used unchanged.
+- `--verify` shows the original and the result to the same Qwen3-VL after generating and
+  records a structured verdict (`instruction_applied`, `outside_unchanged`) on the
+  returned image's `.verification`. `--verify-retries N` regenerates with a new seed at
+  most N times when the verdict fails.
+
 ### img2img
 
 Pass `--image-path` and optionally `--image-strength`, like the other models.

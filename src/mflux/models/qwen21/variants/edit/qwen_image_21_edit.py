@@ -68,11 +68,27 @@ class QwenImage21Edit(nn.Module):
         auto_mask: str | None = None,
         use_step_cache: bool = False,
         step_cache_threshold: float = 0.12,
+        strength: float = 1.0,
+        enhance_prompt: bool = False,
+        verify: bool = False,
+        verify_retries: int = 0,
     ) -> GeneratedImage:
         # Normalize inputs to PIL up front (same normalization order as the reference).
         # open_oriented applies the file's EXIF Orientation tag so a portrait JPEG stored
         # landscape is encoded the way it displays; RGBA mode is preserved for the VAE.
         images = [open_oriented(img if isinstance(img, Image.Image) else img) for img in image_paths]
+
+        if not 0.0 < strength <= 1.0:
+            raise ValueError(f"strength must be in (0, 1], got {strength}")
+
+        # 0. Optional prompt rewriting: the official Qwen-Image-2.1 serving recipe
+        # rewrites terse edit instructions into detailed descriptions with a VL model
+        # before encoding. The in-memory Qwen3-VL (with its untied lm_head) does it
+        # without extra weights; the ORIGINAL instruction still drives verification.
+        original_prompt = prompt
+        if enhance_prompt:
+            prompt = self._rewrite_prompt(prompt, vision_source=images[0])
+            logger.info("enhance_prompt: %r -> %r", original_prompt, prompt)
 
         # 1. Resize every condition image to its own area-normalized, /32-aligned size.
         # The vision encoder rejects sequences beyond a 200:1 aspect ratio; the bounds
@@ -103,8 +119,10 @@ class QwenImage21Edit(nn.Module):
             height=height,
             guidance=guidance,
             scheduler=scheduler,
-            image_path=None,
-            image_strength=None,
+            # reuse the img2img machinery for edit strength: image_path + strength make
+            # init_time_step start the denoising loop partway down the sigma schedule
+            image_path=str(image_paths[0]) if not isinstance(image_paths[0], Image.Image) else "condition",
+            image_strength=strength if strength < 1.0 else None,
             model_config=self.model_config,
             num_inference_steps=num_inference_steps,
         )
@@ -148,19 +166,18 @@ class QwenImage21Edit(nn.Module):
             )
         ref_latents = mx.concatenate(ref_latents, axis=1).astype(ModelConfig.precision)
 
-        # 3b. Inpainting prep: the blend source is the first condition image encoded at
-        # the OUTPUT dimensions, so unmasked tokens can follow the reference's own
-        # noised trajectory in the denoising loop (flow matching:
-        # x_sigma = ref + sigma * (noise - ref)); the final pixel composite then makes
-        # unmasked content exactly the original, not just a VAE-roundtrip copy.
+        # 3b. Reference at output dimensions: the inpaint blend source, and the anchor
+        # for partial-strength starts. x_sigma = ref + sigma * (noise - ref) is the
+        # flow-matching interpolation that matches the Euler update, so unmasked tokens
+        # can be pulled onto the reference's own trajectory each step, and strength < 1
+        # can start from the reference noised at the schedule's starting sigma.
+        start_step = config.init_time_step  # 0 unless strength < 1
         blend_mask = None
         blend_source = None
         init_noise = None
         blend_image = None
-        if inpaint_mask is not None:
+        if inpaint_mask is not None or start_step > 0:
             latent_h, latent_w = config.height // 16, config.width // 16
-            mask_grid = Qwen21Grounding.to_latent_mask(inpaint_mask, latent_h, latent_w)
-            blend_mask = mx.array(mask_grid.reshape(1, latent_h * latent_w, 1)).astype(ModelConfig.precision)
             base = images[0].convert("RGBA")
             white = Image.new("RGB", base.size, (255, 255, 255))
             white.paste(base, mask=base.getchannel("A"))
@@ -170,6 +187,14 @@ class QwenImage21Edit(nn.Module):
                 latents=encoded, height=encoded.shape[2] * 16, width=encoded.shape[3] * 16
             ).astype(ModelConfig.precision)
             init_noise = latents
+        if inpaint_mask is not None:
+            mask_grid = Qwen21Grounding.to_latent_mask(inpaint_mask, latent_h, latent_w)
+            blend_mask = mx.array(mask_grid.reshape(1, latent_h * latent_w, 1)).astype(ModelConfig.precision)
+        if start_step > 0:
+            # strength start: seed the loop from the reference noised to sigma_start
+            # instead of pure noise; the loop below then begins at step `start_step`
+            sigma_start = config.scheduler.sigmas[start_step].astype(latents.dtype)
+            latents = blend_source + sigma_start * (init_noise - blend_source)
 
         # 4. Encode prompt + condition images with the Qwen3-VL encoder into the
         # template-ordered run layout the transformer consumes.
@@ -262,7 +287,8 @@ class QwenImage21Edit(nn.Module):
             original = mx.array(original)
             # float32 compositing keeps unmasked pixels exactly the original
             decoded = repaint * decoded.astype(mx.float32) + (1.0 - repaint) * original
-        return ImageUtil.to_image(
+
+        image = ImageUtil.to_image(
             decoded_latents=decoded,
             config=config,
             seed=seed,
@@ -272,6 +298,43 @@ class QwenImage21Edit(nn.Module):
             negative_prompt=negative_prompt,
             image_paths=image_paths if not isinstance(image_paths[0], Image.Image) else None,
         )
+        if not verify:
+            return image
+
+        # 6. Optional self-check with the in-memory Qwen3-VL; on a failed verdict,
+        # retry with a different seed (the prompt/layout work is cached per call only,
+        # so each retry pays a full generation -- hence retries are opt-in).
+        verification = self._verify_output(original_prompt, images[0], image.image)
+        retries = 0
+        while not verification.get("verified") and retries < verify_retries:
+            retries += 1
+            logger.info("verify failed (%s); retry %d/%d", verification, retries, verify_retries)
+            retry_image = self.generate_image(
+                seed=seed + retries,
+                prompt=original_prompt,
+                image_paths=image_paths,
+                num_inference_steps=num_inference_steps,
+                height=height,
+                width=width,
+                guidance=guidance,
+                negative_prompt=negative_prompt,
+                scheduler=scheduler,
+                output_resolution=output_resolution,
+                use_kv_cache=use_kv_cache,
+                mask_image=mask_image,
+                auto_mask=auto_mask,
+                use_step_cache=use_step_cache,
+                step_cache_threshold=step_cache_threshold,
+                strength=strength,
+                enhance_prompt=enhance_prompt,
+            )
+            retry_verification = self._verify_output(original_prompt, images[0], retry_image.image)
+            if retry_verification.get("verified"):
+                logger.info("verify passed on retry %d", retries)
+                retry_image.verification = {**retry_verification, "retries": retries}
+                return retry_image
+        image.verification = {**verification, "retries": retries}
+        return image
 
     def _resolve_mask(
         self,
@@ -313,6 +376,78 @@ class QwenImage21Edit(nn.Module):
             )
         logger.info("auto_mask '%s' resolved to bbox %s", auto_mask, tuple(round(v, 3) for v in bbox))
         return Qwen21Grounding.rasterize_mask(bbox, (width, height))
+
+    def _rewrite_prompt(self, prompt: str, vision_source: Image.Image) -> str:
+        # Official serving recipe: rewrite a terse instruction into a detailed
+        # description before encoding. Grounded on a small copy of the first condition
+        # image; a failed parse falls back to the original instruction (never worse).
+        if not prompt.strip():
+            return prompt
+        try:
+            feed = self._vision_feed(vision_source)
+            pixel_values, grid_thw = feed
+            _, grid_h, grid_w = (int(v) for v in grid_thw[0].tolist())
+            n_tokens = (grid_h // 2) * (grid_w // 2)
+            tokenizer = self.tokenizers["qwen21"]
+            text = (
+                "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+                + Qwen21Grounding.REWRITE_PROMPT.format(instruction=prompt)
+                + "<|im_end|>\n<|im_start|>assistant\n"
+            )
+            input_ids = mx.array([Qwen21Grounding.tokenize_with_images(tokenizer, text, [n_tokens])], dtype=mx.int32)
+            reply_ids = self.text_encoder.generate(
+                input_ids, pixel_values=pixel_values, image_grid_thw=grid_thw, max_new_tokens=256
+            )
+            reply = tokenizer.tokenizer.decode(reply_ids)
+            rewritten = Qwen21Grounding.parse_rewrite(reply)
+            if rewritten is None:
+                logger.warning("enhance_prompt could not parse the rewrite reply; using the original")
+                return prompt
+            return rewritten
+        except Exception as exc:  # noqa: BLE001 - rewriting is best-effort by design
+            logger.warning("enhance_prompt failed (%s); using the original", exc)
+            return prompt
+
+    def _vision_feed(self, vision_image: Image.Image, budget: int = 512) -> tuple[mx.array, mx.array]:
+        ratio = vision_image.size[0] / vision_image.size[1]
+        feed_width, feed_height = self._calculate_dimensions(budget * budget, ratio)
+        grounding_image = vision_image.resize((feed_width, feed_height), Image.BICUBIC)
+        return Qwen21ImageProcessor().preprocess([grounding_image])
+
+    def _verify_output(self, instruction: str, original: Image.Image, output: Image.Image) -> dict:
+        # Post-edit self-check with the in-memory Qwen3-VL: original + output side by
+        # side, structured verdict parsed from the reply. Coarse by design (did the
+        # edit apply; is the rest preserved) -- not an aesthetic score.
+        original_rgb = original.convert("RGB")
+        output_rgb = output.convert("RGB")
+        feeds = [self._vision_feed(original_rgb), self._vision_feed(output_rgb)]
+        pixel_values = mx.concatenate([pv for pv, _ in feeds], axis=0)
+        grid_thw = mx.concatenate([g for _, g in feeds], axis=0)
+        token_counts = []
+        for grid in (feeds[0][1], feeds[1][1]):
+            _, grid_h, grid_w = (int(v) for v in grid[0].tolist())
+            token_counts.append((grid_h // 2) * (grid_w // 2))
+        tokenizer = self.tokenizers["qwen21"]
+        text = (
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+            "<|vision_start|><|image_pad|><|vision_end|>"
+            + Qwen21Grounding.VERIFY_PROMPT.format(instruction=instruction)
+            + "<|im_end|>\n<|im_start|>assistant\n"
+        )
+        input_ids = mx.array([Qwen21Grounding.tokenize_with_images(tokenizer, text, token_counts)], dtype=mx.int32)
+        reply_ids = self.text_encoder.generate(
+            input_ids, pixel_values=pixel_values, image_grid_thw=grid_thw, max_new_tokens=64
+        )
+        reply = tokenizer.tokenizer.decode(reply_ids)
+        verdict = Qwen21Grounding.parse_verification(reply)
+        if verdict is None:
+            return {"verified": False, "parse_failed": True, "reply": reply[:120]}
+        applied, unchanged = verdict
+        return {
+            "verified": applied and unchanged,
+            "instruction_applied": applied,
+            "outside_unchanged": unchanged,
+        }
 
     def _encode_prompt_with_images(
         self,

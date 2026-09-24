@@ -44,6 +44,29 @@ def build_parser() -> CommandLineParser:
         default=0.12,
         help="Step-cache aggressiveness: higher skips more (default: 0.12).",
     )
+    parser.add_argument(
+        "--strength",
+        type=float,
+        default=1.0,
+        help="Edit strength in (0, 1]: 1.0 fully re-denoises from noise, lower values "
+        "start from the reference partway down the schedule for subtler edits.",
+    )
+    parser.add_argument(
+        "--enhance-prompt",
+        action="store_true",
+        help="Rewrite the instruction into a detailed prompt first (official serving recipe).",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="After generating, self-check the result with the built-in Qwen3-VL.",
+    )
+    parser.add_argument(
+        "--verify-retries",
+        type=int,
+        default=0,
+        help="Regenerate with a new seed when verification fails, at most this many times.",
+    )
     return parser
 
 
@@ -94,7 +117,13 @@ def main():
                 auto_mask=args.auto_mask,
                 use_step_cache=args.use_step_cache,
                 step_cache_threshold=args.step_cache_threshold,
+                strength=args.strength,
+                enhance_prompt=args.enhance_prompt,
+                verify=args.verify,
+                verify_retries=args.verify_retries,
             )
+            if getattr(image, "verification", None):
+                print(f"verification: {image.verification}")
             image.save(path=Path(args.output.format(seed=seed)), export_json_metadata=args.metadata)
     except (StopImageGenerationException, PromptFileReadError) as exc:
         print(exc)

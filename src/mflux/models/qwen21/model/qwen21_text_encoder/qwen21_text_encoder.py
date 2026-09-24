@@ -234,11 +234,33 @@ class Qwen21TextEncoder(nn.Module):
         max_new_tokens: int = 64,
         stop_token_ids: tuple[int, ...] = (151645, 151643),
     ) -> list[int]:
-        # Grounded decoding with the same language model the edit prompt encoder uses:
+        # Grounded decoding with the same language model the edit prompt encoder uses.
+        return self.generate(
+            input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            image_token_id=image_token_id,
+            max_new_tokens=max_new_tokens,
+            stop_token_ids=stop_token_ids,
+        )
+
+    def generate(
+        self,
+        input_ids: mx.array,
+        pixel_values: mx.array | None = None,
+        image_grid_thw: mx.array | None = None,
+        image_token_id: int = 151655,
+        max_new_tokens: int = 64,
+        stop_token_ids: tuple[int, ...] = (151645, 151643),
+    ) -> list[int]:
+        # Greedy decoding with the same language model the edit prompt encoder uses:
         # one vision+prompt prefill into a per-layer KV cache, then greedy single-token
-        # steps. The encoder is a full Qwen3-VL (lm_head tied to the embeddings), so
-        # this runs without any extra weights; deepstack injects during the prefill
-        # exactly as in forward_vl, and text-only continuation tokens need none.
+        # steps. The encoder is a full Qwen3-VL with its own untied lm_head, so this
+        # runs without any extra weights; deepstack injects during the prefill exactly
+        # as in forward_vl, and text-only continuation tokens need none. Serves
+        # grounding (locate_object), prompt rewriting, and output verification.
+        if self.lm_head is None:
+            raise RuntimeError("generate() requires the language-model head (Qwen21TextEncoder(with_visual=True))")
         hidden_states, _, gather_index, keep, deepstack_embeds, positions = self._embed_with_vision(
             input_ids, pixel_values, image_grid_thw, image_token_id
         )
