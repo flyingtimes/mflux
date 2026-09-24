@@ -10,9 +10,10 @@ from mflux.models.common.config import ModelConfig
 from mflux.models.common.config.config import Config
 from mflux.models.common.vae.vae_util import VAEUtil
 from mflux.models.qwen21.latent_creator.qwen21_latent_creator import Qwen21LatentCreator
+from mflux.models.qwen21.model.qwen21_text_encoder.qwen21_grounding import Qwen21Grounding
 from mflux.models.qwen21.model.qwen21_text_encoder.qwen21_prompt_encoder import Qwen21PromptEncoder
 from mflux.models.qwen21.model.qwen21_text_encoder.qwen21_text_encoder import Qwen21TextEncoder
-from mflux.models.qwen21.model.qwen21_transformer.qwen21_transformer import Qwen21Transformer
+from mflux.models.qwen21.model.qwen21_transformer.qwen21_transformer import Qwen21Transformer, StepCache
 from mflux.models.qwen21.model.qwen21_vae.qwen21_vae import Qwen21VAE
 from mflux.models.qwen21.qwen21_edit_initializer import Qwen21EditInitializer
 from mflux.models.qwen21.tokenizer.qwen21_image_processor import Qwen21ImageProcessor
@@ -63,6 +64,10 @@ class QwenImage21Edit(nn.Module):
         scheduler: str = "linear",
         output_resolution: int = 1024,
         use_kv_cache: bool = True,
+        mask_image: str | Path | Image.Image | None = None,
+        auto_mask: str | None = None,
+        use_step_cache: bool = False,
+        step_cache_threshold: float = 0.12,
     ) -> GeneratedImage:
         # Normalize inputs to PIL up front (same normalization order as the reference).
         # open_oriented applies the file's EXIF Orientation tag so a portrait JPEG stored
@@ -117,6 +122,18 @@ class QwenImage21Edit(nn.Module):
                 vision_images.append(img.convert("RGB"))
         pixel_values, grid_thw = Qwen21ImageProcessor().preprocess(vision_images)
 
+        # 2b. Inpaint mask: an explicit mask_image wins; auto_mask instead asks the
+        # in-memory Qwen3-VL where the named object is and rasterizes its answer.
+        # White = repaint, black = preserve; the mask drives per-step latent blending
+        # plus a final pixel composite.
+        inpaint_mask = self._resolve_mask(
+            mask_image=mask_image,
+            auto_mask=auto_mask,
+            vision_image=vision_images[0],
+            width=width,
+            height=height,
+        )
+
         # 3. Pixel path: the VAE encodes full RGBA (the alpha channel can carry edit masks).
         ref_latents = []
         for img in resized_images:
@@ -130,6 +147,29 @@ class QwenImage21Edit(nn.Module):
                 )
             )
         ref_latents = mx.concatenate(ref_latents, axis=1).astype(ModelConfig.precision)
+
+        # 3b. Inpainting prep: the blend source is the first condition image encoded at
+        # the OUTPUT dimensions, so unmasked tokens can follow the reference's own
+        # noised trajectory in the denoising loop (flow matching:
+        # x_sigma = ref + sigma * (noise - ref)); the final pixel composite then makes
+        # unmasked content exactly the original, not just a VAE-roundtrip copy.
+        blend_mask = None
+        blend_source = None
+        init_noise = None
+        blend_image = None
+        if inpaint_mask is not None:
+            latent_h, latent_w = config.height // 16, config.width // 16
+            mask_grid = Qwen21Grounding.to_latent_mask(inpaint_mask, latent_h, latent_w)
+            blend_mask = mx.array(mask_grid.reshape(1, latent_h * latent_w, 1)).astype(ModelConfig.precision)
+            base = images[0].convert("RGBA")
+            white = Image.new("RGB", base.size, (255, 255, 255))
+            white.paste(base, mask=base.getchannel("A"))
+            blend_image = white.resize((config.width, config.height), Image.BICUBIC)
+            encoded = self.vae.encode(QwenImage21Edit._to_vae_tensor(blend_image))
+            blend_source = Qwen21LatentCreator.pack_latents(
+                latents=encoded, height=encoded.shape[2] * 16, width=encoded.shape[3] * 16
+            ).astype(ModelConfig.precision)
+            init_noise = latents
 
         # 4. Encode prompt + condition images with the Qwen3-VL encoder into the
         # template-ordered run layout the transformer consumes.
@@ -166,6 +206,8 @@ class QwenImage21Edit(nn.Module):
         # conditional and unconditional passes need separate caches (different embeds).
         kv_cache = [None] * len(self.transformer.transformer_blocks) if use_kv_cache else None
         neg_kv_cache = [None] * len(self.transformer.transformer_blocks) if (use_kv_cache and do_true_cfg) else None
+        step_cache = StepCache(step_cache_threshold) if use_step_cache else None
+        neg_step_cache = StepCache(step_cache_threshold) if (use_step_cache and do_true_cfg) else None
         ctx = self.callbacks.start(seed=seed, prompt=prompt, config=config)
         ctx.before_loop(latents)
 
@@ -180,6 +222,7 @@ class QwenImage21Edit(nn.Module):
                     layout=prompt_layout,
                     kv_cache=kv_cache,
                     kv_cache_mode=kv_mode if use_kv_cache else None,
+                    step_cache=step_cache,
                 )
                 if do_true_cfg:
                     noise_negative = self.transformer.__call_edit__(
@@ -189,10 +232,17 @@ class QwenImage21Edit(nn.Module):
                         layout=negative_prompt_layout,
                         kv_cache=neg_kv_cache,
                         kv_cache_mode=kv_mode if use_kv_cache else None,
+                        step_cache=neg_step_cache,
                     )
                     noise = noise_negative + config.guidance * (noise - noise_negative)
 
                 latents = config.scheduler.step(noise=noise, timestep=t, latents=latents)
+                if blend_mask is not None:
+                    # after the Euler update the state sits at sigma_{t+1}; pull the
+                    # unmasked tokens onto the reference's own trajectory at that sigma
+                    sigma_next = config.scheduler.sigmas[t + 1].astype(latents.dtype)
+                    noised_ref = blend_source + sigma_next * (init_noise - blend_source)
+                    latents = blend_mask * latents + (1.0 - blend_mask) * noised_ref
                 ctx.in_loop(t, latents)
                 mx.eval(latents)
             except KeyboardInterrupt:  # noqa: PERF203
@@ -205,6 +255,13 @@ class QwenImage21Edit(nn.Module):
 
         latents = Qwen21LatentCreator.unpack_latents(latents=latents, height=config.height, width=config.width)
         decoded = VAEUtil.decode(vae=self.vae, latent=latents, tiling_config=self.tiling_config)
+        if inpaint_mask is not None:
+            keep = np.asarray(inpaint_mask, dtype=np.float32) / 255.0  # (H, W): 1 = repaint
+            original = np.asarray(blend_image, dtype=np.float32).transpose(2, 0, 1)[None] / 127.5 - 1.0
+            repaint = mx.array(keep[None, None, :, :])
+            original = mx.array(original)
+            # float32 compositing keeps unmasked pixels exactly the original
+            decoded = repaint * decoded.astype(mx.float32) + (1.0 - repaint) * original
         return ImageUtil.to_image(
             decoded_latents=decoded,
             config=config,
@@ -215,6 +272,47 @@ class QwenImage21Edit(nn.Module):
             negative_prompt=negative_prompt,
             image_paths=image_paths if not isinstance(image_paths[0], Image.Image) else None,
         )
+
+    def _resolve_mask(
+        self,
+        mask_image: str | Path | Image.Image | None,
+        auto_mask: str | None,
+        vision_image: Image.Image,
+        width: int,
+        height: int,
+    ) -> Image.Image | None:
+        if mask_image is not None and auto_mask is not None:
+            logger.warning("both mask_image and auto_mask were given; using the explicit mask_image")
+        if mask_image is not None:
+            return open_oriented(mask_image).convert("L").resize((width, height), Image.BILINEAR)
+        if auto_mask is None:
+            return None
+        if not auto_mask.strip():
+            raise ValueError("auto_mask must name an object to locate")
+        # Ground on a small copy: fewer image tokens make the prefill cheap. The reply's
+        # coordinates are relative to the shown image, so its size is kept for parsing.
+        ratio = vision_image.size[0] / vision_image.size[1]
+        feed_width, feed_height = self._calculate_dimensions(512 * 512, ratio)
+        grounding_image = vision_image.resize((feed_width, feed_height), Image.BICUBIC)
+        pixel_values, grid_thw = Qwen21ImageProcessor().preprocess([grounding_image])
+        _, grid_h, grid_w = (int(v) for v in grid_thw[0].tolist())
+        n_tokens = (grid_h // 2) * (grid_w // 2)
+
+        tokenizer = self.tokenizers["qwen21"]
+        input_ids = mx.array(
+            [Qwen21Grounding.build_input_ids(tokenizer, n_tokens, auto_mask)],
+            dtype=mx.int32,
+        )
+        reply_ids = self.text_encoder.locate_object(input_ids, pixel_values, grid_thw)
+        reply = tokenizer.tokenizer.decode(reply_ids)
+        bbox = Qwen21Grounding.parse_bbox(reply, (feed_width, feed_height))
+        if bbox is None:
+            raise ValueError(
+                f"auto_mask could not locate '{auto_mask}' in the first condition image "
+                f"(model reply: {reply[:120]!r}); provide an explicit mask_image instead"
+            )
+        logger.info("auto_mask '%s' resolved to bbox %s", auto_mask, tuple(round(v, 3) for v in bbox))
+        return Qwen21Grounding.rasterize_mask(bbox, (width, height))
 
     def _encode_prompt_with_images(
         self,

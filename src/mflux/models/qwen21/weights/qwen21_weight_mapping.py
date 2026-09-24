@@ -61,6 +61,9 @@ class Qwen21WeightMapping(WeightMapping):
                 to_pattern="embed_tokens.weight",
                 from_pattern=["model.language_model.embed_tokens.weight"],
             ),
+            # the checkpoint ships an UNTIED lm_head: unused by the diffusion path but
+            # required for grounded decoding (Qwen21TextEncoder.locate_object)
+            WeightTarget(to_pattern="lm_head.weight", from_pattern=["lm_head.weight"]),
             WeightTarget(to_pattern="norm.weight", from_pattern=["model.language_model.norm.weight"]),
         ]
         for layer in range(Qwen21WeightMapping.NUM_TEXT_LAYERS):

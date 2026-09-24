@@ -1,3 +1,4 @@
+import argparse
 from pathlib import Path
 
 from mflux.callbacks.callback_manager import CallbackManager
@@ -19,6 +20,30 @@ def build_parser() -> CommandLineParser:
     parser.add_image_generator_arguments(supports_metadata_config=True, supports_dimension_scale_factor=True)
     parser.add_image_paths_arguments()
     parser.add_output_arguments()
+    parser.add_argument(
+        "--mask-image",
+        type=str,
+        default=None,
+        help="Path to an inpaint mask (white = repaint, black = preserve) aligned with the first condition image.",
+    )
+    parser.add_argument(
+        "--auto-mask",
+        type=str,
+        default=None,
+        help="Describe an object to mask ('the red shirt'); the in-memory Qwen3-VL locates it. Ignored with --mask-image.",
+    )
+    parser.add_argument(
+        "--use-step-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip unchanged transformer blocks on nearby denoising steps (faster, slightly different output).",
+    )
+    parser.add_argument(
+        "--step-cache-threshold",
+        type=float,
+        default=0.12,
+        help="Step-cache aggressiveness: higher skips more (default: 0.12).",
+    )
     return parser
 
 
@@ -65,6 +90,10 @@ def main():
                 guidance=args.guidance if args.guidance is not None else 1.0,
                 scheduler=args.scheduler,
                 num_inference_steps=args.steps,
+                mask_image=args.mask_image,
+                auto_mask=args.auto_mask,
+                use_step_cache=args.use_step_cache,
+                step_cache_threshold=args.step_cache_threshold,
             )
             image.save(path=Path(args.output.format(seed=seed)), export_json_metadata=args.metadata)
     except (StopImageGenerationException, PromptFileReadError) as exc:

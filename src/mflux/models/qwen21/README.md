@@ -113,6 +113,34 @@ prefix and later steps attend it. `QwenImage21Edit.generate_image(..., use_kv_ca
 (enabled by default) measured 3.6x faster on a three-reference 1024² edit (28 -> 7.7 s/step
 on M2 Ultra bf16) with pixel-identical output against the uncached path.
 
+### Inpainting and outpainting
+
+Pass a mask aligned with the first condition image (`--mask-image mask.png`, or the
+`mask_image` Python/API parameter): white marks the region to repaint, black the region to
+preserve. During denoising the unmasked latent tokens are pulled onto the reference's own
+noised trajectory each step, and the decoded result is composited with the original pixels
+outside the mask, so untouched content stays exactly the original. Outpainting is the same
+mechanism: paste the image onto a larger canvas, mask the added border, and prompt for the
+surroundings.
+
+### Auto-masking (visual grounding)
+
+Instead of drawing the mask, describe the object: `--auto-mask "the dress"`. The edit model
+already holds a full Qwen3-VL language model (the encoder ships its generation head tied to
+the embeddings), so the variant asks it where the named object is, parses the returned
+bounding box, feathers it into a mask, and feeds the inpainting path above. The reply is
+parsed as absolute coordinates of the (resized) image it was shown; an unparseable reply
+raises an error pointing at `mask_image` instead.
+
+### Step cache
+
+`--use-step-cache` (Python: `use_step_cache=True`) enables first-block step skipping on top
+of the prefix KV cache: block 0 always runs, and when a relative-L1 signal of consecutive
+steps stays under `step_cache_threshold` (default 0.12) the remaining blocks reuse the
+previous step's hidden state, with the output norm re-applied to the current timestep.
+Nearby denoising steps differ little, so most steps skip 31 of 32 blocks; output stays
+close to the baseline but is not pixel-identical. Requires `use_kv_cache=True`.
+
 ### img2img
 
 Pass `--image-path` and optionally `--image-strength`, like the other models.

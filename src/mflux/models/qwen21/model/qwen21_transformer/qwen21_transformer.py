@@ -13,6 +13,37 @@ from mflux.models.qwen21.model.qwen21_transformer.qwen21_time_text_embed import 
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_transformer_block import Qwen21TransformerBlock
 
 
+class StepCache:
+    """First-block step cache for the edit denoising loop.
+
+    Consecutive denoising steps feed the transformer nearly identical inputs, so the
+    blocks after the first can reuse the previous step's final hidden state whenever a
+    relative-L1 signal accumulated over steps stays under the threshold. norm_out and
+    proj_out always re-run with the current timestep modulation, so skipped steps still
+    track the schedule. One instance per transformer branch (conditional and
+    unconditional need separate state).
+    """
+
+    def __init__(self, threshold: float = 0.12) -> None:
+        self.threshold = threshold
+        self.hidden: mx.array | None = None  # final pre-norm hidden from the last computed step
+        self._signal: mx.array | None = None  # first block's output from the last computed step
+        self._accumulated = 0.0
+
+    def should_skip(self, signal: mx.array) -> bool:
+        if self._signal is None:
+            return False
+        self._accumulated += float(mx.mean(mx.abs(signal - self._signal)) / (mx.mean(mx.abs(signal)) + 1e-6))
+        if self._accumulated < self.threshold:
+            return True
+        self._accumulated = 0.0
+        return False
+
+    def store(self, hidden: mx.array, signal: mx.array) -> None:
+        self.hidden = hidden
+        self._signal = signal
+
+
 class Qwen21Transformer(nn.Module):
     def __init__(
         self,
@@ -146,6 +177,7 @@ class Qwen21Transformer(nn.Module):
         layout: list[tuple],
         kv_cache: list | None = None,
         kv_cache_mode: str | None = None,
+        step_cache: StepCache | None = None,
     ) -> mx.array:
         # layout: template-ordered runs, each ('text', embeds (1, n, 4096)) or
         # ('image', latents (1, h*w, 64), (h, w)) for one condition image; the target
@@ -156,6 +188,9 @@ class Qwen21Transformer(nn.Module):
         # kv_cache/kv_cache_mode enable the prefix KV cache: "extract" prefills a
         # per-layer K/V cache of the text+reference prefix, "cached" recomputes only
         # target queries against cache + own tokens.
+        #
+        # step_cache enables first-block step skipping: when consecutive steps differ
+        # little, the blocks after the first reuse the previous step's hidden state.
         timestep = Qwen21Transformer._compute_timestep(t, config)
         target_height, target_width = config.height // 16, config.width // 16
         target_tokens = target_height * target_width
@@ -175,19 +210,51 @@ class Qwen21Transformer(nn.Module):
             scale = self.norm_out.linear(nn.silu(temb))
             scale = mx.broadcast_to(scale[:, None, :], (1, target_tokens, scale.shape[-1]))
             hidden_states = self.img_in(target_latents)
-            for index_block, block in enumerate(self.transformer_blocks):
-                hidden_states, kv_cache[index_block] = block(
-                    hidden_states,
-                    mod1,
-                    mod2,
-                    rope_cos,
-                    rope_sin,
-                    None,
-                    None,
-                    kv_cache[index_block],
-                    "cached",
-                    prefix_tokens,
-                )
+            first_block = self.transformer_blocks[0]
+            hidden_states, kv_cache[0] = first_block(
+                hidden_states,
+                mod1,
+                mod2,
+                rope_cos,
+                rope_sin,
+                None,
+                None,
+                kv_cache[0],
+                "cached",
+                prefix_tokens,
+            )
+            signal = hidden_states  # input to the first skippable block
+            if step_cache is None:
+                for index_block in range(1, len(self.transformer_blocks)):
+                    hidden_states, kv_cache[index_block] = self.transformer_blocks[index_block](
+                        hidden_states,
+                        mod1,
+                        mod2,
+                        rope_cos,
+                        rope_sin,
+                        None,
+                        None,
+                        kv_cache[index_block],
+                        "cached",
+                        prefix_tokens,
+                    )
+            elif step_cache.should_skip(signal):
+                hidden_states = step_cache.hidden
+            else:
+                for index_block in range(1, len(self.transformer_blocks)):
+                    hidden_states, kv_cache[index_block] = self.transformer_blocks[index_block](
+                        hidden_states,
+                        mod1,
+                        mod2,
+                        rope_cos,
+                        rope_sin,
+                        None,
+                        None,
+                        kv_cache[index_block],
+                        "cached",
+                        prefix_tokens,
+                    )
+                step_cache.store(hidden_states, signal)
             return self.proj_out(self.norm_out(hidden_states, scale))
 
         timestep_rows = mx.concatenate([timestep, mx.zeros((1,), dtype=timestep.dtype)])
@@ -203,6 +270,7 @@ class Qwen21Transformer(nn.Module):
                 segments,
                 prefix_tokens,
                 kv_cache,
+                step_cache,
             )
             for index_block, pair in enumerate(prefix_kv):
                 kv_cache[index_block] = pair
@@ -258,6 +326,7 @@ class Qwen21Transformer(nn.Module):
         segments: list[tuple[int, int, bool, mx.array | None]],
         prefix_tokens: int = 0,
         kv_cache: list | None = None,
+        step_cache: StepCache | None = None,
     ) -> tuple[mx.array, list]:
         text_len = sum(run[1].shape[1] for run in layout if run[0] == "text")
         ref_tokens = sum(run[2][0] * run[2][1] for run in layout if run[0] == "image")
@@ -281,6 +350,7 @@ class Qwen21Transformer(nn.Module):
 
         kv_mode = "extract" if kv_cache is not None else None
         prefix_kv = []
+        signal = None
         for index_block, block in enumerate(self.transformer_blocks):
             pair = kv_cache[index_block] if kv_cache is not None else None
             out = block(
@@ -291,6 +361,13 @@ class Qwen21Transformer(nn.Module):
                 prefix_kv.append(pair)
             else:
                 hidden_states = out
+            if step_cache is not None and index_block == 0:
+                signal = hidden_states  # input to the first skippable block
+        if step_cache is not None and kv_cache is not None:
+            # extract step: run every block (the K/V cache must complete) but record
+            # the target-only hidden so later cached steps can skip blocks 1..N
+            n_prefix = ref_tokens + text_len
+            step_cache.store(hidden_states[:, n_prefix:], signal[:, n_prefix:])
 
         scale = self.norm_out.linear(nn.silu(temb))
         scale = Qwen21Transformer._select_modulation_rows_edit(scale, ref_tokens + text_len, target_tokens)

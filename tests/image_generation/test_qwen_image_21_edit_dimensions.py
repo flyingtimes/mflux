@@ -72,7 +72,7 @@ class _RecordingTF:
     def __init__(self):
         self.calls = []
 
-    def __call_edit__(self, t, config, target_latents, layout, kv_cache=None, kv_cache_mode=None):
+    def __call_edit__(self, t, config, target_latents, layout, kv_cache=None, kv_cache_mode=None, step_cache=None):
         self.calls.append((config.width, config.height, t))
         target = (config.height // 16) * (config.width // 16)
         return mx.zeros((1, target, 64), mx.bfloat16)

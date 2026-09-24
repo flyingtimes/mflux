@@ -45,6 +45,9 @@ class Qwen21TextEncoder(nn.Module):
             for _ in range(num_hidden_layers)
         ]
         self.norm = Qwen3VLRMSNorm(hidden_size, eps=rms_norm_eps)
+        # the checkpoint ships an UNTIED language-model head; the diffusion path never
+        # touches it, but grounded decoding (locate_object, edit variant only) needs it
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False) if with_visual else None
         self.rotary_emb = Qwen3VLRotaryEmbedding(
             dim=head_dim,
             max_position_embeddings=max_position_embeddings,
@@ -140,22 +143,35 @@ class Qwen21TextEncoder(nn.Module):
                 i += 1
         return mx.array(positions)
 
-    def forward_vl(
+    def _embed_with_vision(
         self,
         input_ids: mx.array,
-        pixel_values: mx.array | None = None,
-        image_grid_thw: mx.array | None = None,
+        pixel_values: mx.array | None,
+        image_grid_thw: mx.array | None,
         image_token_id: int = 151655,
-    ) -> tuple[mx.array, mx.array]:
-        # Edit-mode forward: vision embeds replace <|image_pad|> positions, deepstack
-        # features inject at image positions after the first three decoder layers, and
-        # the hidden states are returned BEFORE the final RMSNorm (what the diffusion
-        # transformer was trained on). Also returns the (1, seq_len) <|image_pad|> mask.
-        if self.visual is None:
-            raise RuntimeError("forward_vl requires the vision tower (Qwen21TextEncoder(with_visual=True))")
+    ) -> tuple[mx.array, mx.array, mx.array, mx.array, list, mx.array]:
+        # Shared prologue for the edit-mode forward and grounded decoding: embeddings
+        # with vision features scattered into <|image_pad|> positions, mrope positions,
+        # and the deepstack features kept separate for the layer loop to inject.
+        # pixel_values=None is a text-only sequence (grounding probes, no image).
+        if pixel_values is not None and self.visual is None:
+            raise RuntimeError("vision features require the vision tower (Qwen21TextEncoder(with_visual=True))")
 
         batch_size, seq_len = input_ids.shape
         hidden_states = self.embed_tokens(input_ids)
+
+        if pixel_values is None:
+            text_mask = mx.zeros(input_ids.shape, dtype=mx.bool_)
+            positions = Qwen21TextEncoder.build_mrope_positions(input_ids, text_mask, None)
+            keep = mx.zeros(input_ids.shape + (1,), dtype=mx.bool_)
+            return (
+                hidden_states,
+                text_mask,
+                mx.zeros(input_ids.shape, dtype=mx.int32),
+                keep,
+                [],
+                positions,
+            )
 
         image_embeds, deepstack_embeds = self.visual(pixel_values, image_grid_thw, return_deepstack=True)
         image_mask = input_ids == image_token_id  # (1, seq_len)
@@ -172,6 +188,23 @@ class Qwen21TextEncoder(nn.Module):
         keep = mask_flat[:, None]  # (seq_len, 1)
         hidden_states = mx.where(keep[None, :, :], gathered[None, :, :], hidden_states)
         positions = Qwen21TextEncoder.build_mrope_positions(input_ids, image_mask, image_grid_thw)
+        return hidden_states, image_mask, gather_index, keep, deepstack_embeds, positions
+
+    def forward_vl(
+        self,
+        input_ids: mx.array,
+        pixel_values: mx.array | None = None,
+        image_grid_thw: mx.array | None = None,
+        image_token_id: int = 151655,
+    ) -> tuple[mx.array, mx.array]:
+        # Edit-mode forward: vision embeds replace <|image_pad|> positions, deepstack
+        # features inject at image positions after the first three decoder layers, and
+        # the hidden states are returned BEFORE the final RMSNorm (what the diffusion
+        # transformer was trained on). Also returns the (1, seq_len) <|image_pad|> mask.
+        batch_size, seq_len = input_ids.shape
+        hidden_states, image_mask, gather_index, keep, deepstack_embeds, positions = self._embed_with_vision(
+            input_ids, pixel_values, image_grid_thw, image_token_id
+        )
         position_embeddings = self.rotary_emb(hidden_states, positions[:, None, :])  # (3, batch=1, seq)
 
         idx = mx.arange(seq_len, dtype=mx.int32)
@@ -191,3 +224,60 @@ class Qwen21TextEncoder(nn.Module):
                 hidden_states = mx.where(keep[None, :, :], (hidden_states[0] + ds_full)[None, :, :], hidden_states)
 
         return hidden_states, image_mask
+
+    def locate_object(
+        self,
+        input_ids: mx.array,
+        pixel_values: mx.array,
+        image_grid_thw: mx.array,
+        image_token_id: int = 151655,
+        max_new_tokens: int = 64,
+        stop_token_ids: tuple[int, ...] = (151645, 151643),
+    ) -> list[int]:
+        # Grounded decoding with the same language model the edit prompt encoder uses:
+        # one vision+prompt prefill into a per-layer KV cache, then greedy single-token
+        # steps. The encoder is a full Qwen3-VL (lm_head tied to the embeddings), so
+        # this runs without any extra weights; deepstack injects during the prefill
+        # exactly as in forward_vl, and text-only continuation tokens need none.
+        hidden_states, _, gather_index, keep, deepstack_embeds, positions = self._embed_with_vision(
+            input_ids, pixel_values, image_grid_thw, image_token_id
+        )
+        seq_len = hidden_states.shape[1]
+        position_embeddings = self.rotary_emb(hidden_states, positions[:, None, :])
+
+        idx = mx.arange(seq_len, dtype=mx.int32)
+        causal = mx.where(
+            idx[None, :] > idx[:, None],
+            mx.full((seq_len, seq_len), -float("inf"), dtype=mx.float32),
+            mx.zeros((seq_len, seq_len), dtype=mx.float32),
+        )
+        total_length = seq_len + max_new_tokens
+        caches = []
+        for layer_index, layer in enumerate(self.layers):
+            hidden_states, cache = layer(
+                hidden_states, causal[None, None, :, :], position_embeddings, max_cache_length=total_length
+            )
+            if layer_index < len(deepstack_embeds):
+                ds_full = deepstack_embeds[layer_index][gather_index].astype(hidden_states.dtype)
+                hidden_states = mx.where(keep[None, :, :], (hidden_states[0] + ds_full)[None, :, :], hidden_states)
+            caches.append(cache)
+        mx.eval(hidden_states)
+
+        last_position = int(positions[0, -1])
+        generated: list[int] = []
+        for step in range(max_new_tokens):
+            logits = self.lm_head(self.norm(hidden_states[:, -1]))
+            next_id = int(mx.argmax(logits[0]).item())
+            if next_id in stop_token_ids:
+                break
+            generated.append(next_id)
+
+            token_hidden = self.embed_tokens(mx.array([[next_id]])).astype(hidden_states.dtype)
+            token_position = mx.full((3, 1, 1), last_position + 1 + step, dtype=mx.int32)
+            token_embeddings = self.rotary_emb(token_hidden, token_position)
+            for layer_index, layer in enumerate(self.layers):
+                token_hidden, cache = layer(token_hidden, None, token_embeddings, past_key_value=caches[layer_index])
+                caches[layer_index] = cache
+            hidden_states = token_hidden
+            mx.eval(hidden_states)
+        return generated
