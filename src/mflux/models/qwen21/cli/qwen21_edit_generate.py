@@ -47,7 +47,12 @@ def main():
 
     try:
         image_paths = [str(p) for p in args.image_paths]
-        width, height = DimensionResolver.resolve_output_dimensions(args.width, args.height, image_paths[-1])
+        width, height = DimensionResolver.resolve_output_dimensions(
+            args.width,
+            args.height,
+            image_paths[-1],
+            dims_specified=CommandLineParser._option_was_provided("--width", "--height"),
+        )
 
         for seed in args.seed:
             image = qwen.generate_image(

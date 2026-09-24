@@ -12,26 +12,35 @@ import re
 import mlx.core as mx
 import numpy as np
 import pytest
-from PIL import Image as PILImage
-from PIL import ImageOps
+from PIL import (
+    Image as PILImage,
+    ImageOps,
+)
 
 from mflux.models.common.config import ModelConfig
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_transformer import Qwen21Transformer
 from mflux.models.qwen21.model.qwen21_vae.qwen21_vae import Qwen21VAE
-from mflux.models.qwen21.qwen21_edit_initializer import Qwen21EditInitializer
 from mflux.models.qwen21.tokenizer.qwen21_image_processor import Qwen21ImageProcessor
 from mflux.models.qwen21.variants.edit.qwen_image_21_edit import QwenImage21Edit
 
 
 class _FakeCtx:
-    def before_loop(self, latents): pass
-    def in_loop(self, t, latents, **kw): pass
-    def after_loop(self, latents): pass
-    def interruption(self, t, latents): pass
+    def before_loop(self, latents):
+        pass
+
+    def in_loop(self, t, latents, **kw):
+        pass
+
+    def after_loop(self, latents):
+        pass
+
+    def interruption(self, t, latents):
+        pass
 
 
 class _FakeCallbacks:
-    def start(self, **kw): return _FakeCtx()
+    def start(self, **kw):
+        return _FakeCtx()
 
 
 class _FakeTokWrap:
@@ -97,6 +106,7 @@ def _make_orientation6_fixture(tmp_path):
     image as it should display (orientation applied)."""
     stored = PILImage.new("L", (64, 32), 255)  # white background
     from PIL import ImageDraw as PILImageDraw
+
     draw = PILImageDraw.Draw(stored)
     draw.rectangle([0, 0, 20, 15], fill=0)  # black marker in the top-left corner
     stored = stored.convert("RGB")
@@ -141,8 +151,9 @@ def test_exif_orientation_reaches_both_encoders(monkeypatch, tmp_path) -> None:
 
     model = _make_stub_model(captured)
 
-    model.generate_image(seed=1, prompt="p", image_paths=[str(path6)],
-                         num_inference_steps=1, width=64, height=64, use_kv_cache=False)
+    model.generate_image(
+        seed=1, prompt="p", image_paths=[str(path6)], num_inference_steps=1, width=64, height=64, use_kv_cache=False
+    )
 
     # vision path: rotated to portrait, RGB (white-composited; source had no alpha)
     [(vis_entry,)] = captured["preprocess"]  # one condition image

@@ -7,28 +7,24 @@ from mflux.utils.scale_factor import ScaleFactor
 
 class DimensionResolver:
     @staticmethod
-    def is_auto(value) -> bool:
-        # the shared CLI parser turns the "auto" default into ScaleFactor(1)
-        return isinstance(value, ScaleFactor) and value.value == 1
-
-    @staticmethod
     def resolve_output_dimensions(
         width: int | ScaleFactor,
         height: int | ScaleFactor,
         reference_image_path: str,
+        dims_specified: bool,
     ) -> tuple[int | None, int | None]:
-        """Translate CLI dimension flags into generate_image arguments.
+        """Translate the edit CLI's dimension flags into generate_image arguments.
 
-        The parser turns the default "auto" into ScaleFactor(1): both dimensions automatic
-        maps to (None, None) so the edit variant derives its ~1MP target from the last condition
-        image. Explicit scale factors resolve against that same image; plain integers pass
-        through (the variant applies its own /16 rounding).
+        With no dimension flag on the command line, both map to (None, None) so the
+        variant derives its ~1MP target from the last condition image's aspect ratio,
+        like the reference pipeline. Once any dimension flag is given, the shared
+        flags' semantics apply: scale factors resolve against the reference image
+        ("1x" is the source's own displayed size) and plain integers pass through;
+        an axis still on its ScaleFactor(1) default then means 1x the source size.
         """
-        if DimensionResolver.is_auto(width) and DimensionResolver.is_auto(height):
+        if not dims_specified:
             return None, None
-        if isinstance(width, ScaleFactor) or isinstance(height, ScaleFactor):
-            return DimensionResolver.resolve(width=width, height=height, reference_image_path=reference_image_path)
-        return int(width), int(height)
+        return DimensionResolver.resolve(width=width, height=height, reference_image_path=reference_image_path)
 
     @staticmethod
     def resolve(

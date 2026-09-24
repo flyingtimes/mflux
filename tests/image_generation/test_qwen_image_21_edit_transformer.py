@@ -1,5 +1,4 @@
 import sys
-from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
@@ -9,18 +8,25 @@ from mflux.models.common.config import ModelConfig
 from mflux.models.common.config.config import Config
 from mflux.models.qwen21.model.qwen21_text_encoder.qwen21_text_encoder import Qwen21TextEncoder
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_transformer import Qwen21Transformer
-from mflux.models.qwen21.variants.edit import qwen_image_21_edit
 
 
 class _FakeCtx:
-    def before_loop(self, latents): pass
-    def in_loop(self, t, latents, **kw): pass
-    def after_loop(self, latents): pass
-    def interruption(self, t, latents): pass
+    def before_loop(self, latents):
+        pass
+
+    def in_loop(self, t, latents, **kw):
+        pass
+
+    def after_loop(self, latents):
+        pass
+
+    def interruption(self, t, latents):
+        pass
 
 
 class _FakeCallbacks:
-    def start(self, **kw): return _FakeCtx()
+    def start(self, **kw):
+        return _FakeCtx()
 
 
 @pytest.mark.fast
@@ -119,16 +125,28 @@ def test_kv_cache_matches_uncached_with_two_references() -> None:
     lat_other = mx.array(rng.standard_normal((1, 16, 64)).astype(np.float32)).astype(mx.bfloat16)
 
     kv_cache = [None] * len(transformer.transformer_blocks)
-    out_extract = transformer.__call_edit__(
-        t=0, config=config, target_latents=lat_first, layout=layout,
-        kv_cache=kv_cache, kv_cache_mode="extract",
+    # the extract pass only fills the cache; its output is deliberately unused
+    transformer.__call_edit__(
+        t=0,
+        config=config,
+        target_latents=lat_first,
+        layout=layout,
+        kv_cache=kv_cache,
+        kv_cache_mode="extract",
     )
     out_cached = transformer.__call_edit__(
-        t=1, config=config, target_latents=lat_other, layout=layout,
-        kv_cache=kv_cache, kv_cache_mode="cached",
+        t=1,
+        config=config,
+        target_latents=lat_other,
+        layout=layout,
+        kv_cache=kv_cache,
+        kv_cache_mode="cached",
     )
     out_fresh = transformer.__call_edit__(
-        t=1, config=config, target_latents=lat_other, layout=layout,
+        t=1,
+        config=config,
+        target_latents=lat_other,
+        layout=layout,
     )
     mx.eval(out_cached)
 
@@ -141,7 +159,6 @@ def test_cli_auto_dimensions_and_scale_factors(monkeypatch, tmp_path) -> None:
     # No dimension flags: width/height must stay None so generate_image derives its
     # ~1MP target from the last condition image. Explicit ints and explicit scale
     # factors must keep working.
-    import sys
     from types import SimpleNamespace
 
     from PIL import Image as PILImage
@@ -157,6 +174,7 @@ def test_cli_auto_dimensions_and_scale_factors(monkeypatch, tmp_path) -> None:
         def __init__(self, **kwargs):
             self.callbacks = SimpleNamespace(register=lambda *a, **kw: None)
             captured["init"] = kwargs
+
         def generate_image(self, **kwargs):
             captured["gen"] = kwargs
             return SimpleNamespace(save=lambda **kw: None)
@@ -165,10 +183,20 @@ def test_cli_auto_dimensions_and_scale_factors(monkeypatch, tmp_path) -> None:
 
     def run(extra):
         captured.clear()
-        monkeypatch.setattr(sys, "argv", [
-            "mflux-generate-qwen-2.1-edit", "--image-paths", str(src), "--prompt", "p",
-            "--output", str(tmp_path / "out_{seed}.png"), *extra,
-        ])
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "mflux-generate-qwen-2.1-edit",
+                "--image-paths",
+                str(src),
+                "--prompt",
+                "p",
+                "--output",
+                str(tmp_path / "out_{seed}.png"),
+                *extra,
+            ],
+        )
         cli.main()
         return captured["gen"]
 
@@ -179,4 +207,9 @@ def test_cli_auto_dimensions_and_scale_factors(monkeypatch, tmp_path) -> None:
     assert gen["width"] == 512 and gen["height"] == 512
 
     gen = run(["--width", "0.5x", "--height", "0.5x"])
-    assert (gen["width"], gen["height"]) == (2016, 1504)  # DimensionResolver rounds to /32
+    assert (gen["width"], gen["height"]) == (2016, 1504)  # DimensionResolver floors to /16
+
+    # an explicit "1x" is the reference's own displayed size, as the flag help
+    # documents -- it must not collapse into the ~1MP derivation of the default
+    gen = run(["--width", "1x", "--height", "1x"])
+    assert (gen["width"], gen["height"]) == (4032, 3024)

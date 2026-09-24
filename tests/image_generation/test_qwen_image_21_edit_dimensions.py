@@ -5,27 +5,31 @@ reporting, and the guidance-without-negative-prompt warning."""
 import logging
 
 import mlx.core as mx
-import numpy as np
 import pytest
 from PIL import Image as PILImage
 
 from mflux.models.common.config import ModelConfig
-from mflux.models.qwen21.model.qwen21_transformer.qwen21_transformer import Qwen21Transformer
-from mflux.models.qwen21.model.qwen21_vae.qwen21_vae import Qwen21VAE
-from mflux.models.qwen21.tokenizer.qwen21_image_processor import Qwen21ImageProcessor
 from mflux.models.qwen21.variants.edit.qwen_image_21_edit import QwenImage21Edit
 from mflux.utils.image_util import ImageUtil
 
 
 class _FakeCtx:
-    def before_loop(self, latents): pass
-    def in_loop(self, t, latents, **kw): pass
-    def after_loop(self, latents): pass
-    def interruption(self, t, latents): pass
+    def before_loop(self, latents):
+        pass
+
+    def in_loop(self, t, latents, **kw):
+        pass
+
+    def after_loop(self, latents):
+        pass
+
+    def interruption(self, t, latents):
+        pass
 
 
 class _FakeCallbacks:
-    def start(self, **kw): return _FakeCtx()
+    def start(self, **kw):
+        return _FakeCtx()
 
 
 class _FakeTokWrap:
@@ -34,6 +38,7 @@ class _FakeTokWrap:
 
     def __call__(self, text, add_special_tokens=False, **kw):
         import re
+
         ids = []
         parts = text.split("<|image_pad|>")
         for i, chunk in enumerate(parts):
@@ -105,16 +110,19 @@ def test_explicit_axis_is_honored_and_missing_axis_derived(tmp_path) -> None:
     model = _stub_model(tf)
     ref = _make_ref(tmp_path, (640, 1280))  # 1:2 portrait -> derived pair (736, 1440)
 
-    model.generate_image(seed=1, prompt="p", image_paths=[ref], num_inference_steps=1,
-                         width=1024, height=None, use_kv_cache=False)
+    model.generate_image(
+        seed=1, prompt="p", image_paths=[ref], num_inference_steps=1, width=1024, height=None, use_kv_cache=False
+    )
     assert tf.calls[-1][:2] == (1024, 1440)  # explicit width kept, height derived
 
-    model.generate_image(seed=1, prompt="p", image_paths=[ref], num_inference_steps=1,
-                         width=None, height=768, use_kv_cache=False)
+    model.generate_image(
+        seed=1, prompt="p", image_paths=[ref], num_inference_steps=1, width=None, height=768, use_kv_cache=False
+    )
     assert tf.calls[-1][:2] == (736, 768)  # explicit height kept, width derived
 
-    model.generate_image(seed=1, prompt="p", image_paths=[ref], num_inference_steps=1,
-                         width=None, height=None, use_kv_cache=False)
+    model.generate_image(
+        seed=1, prompt="p", image_paths=[ref], num_inference_steps=1, width=None, height=None, use_kv_cache=False
+    )
     assert tf.calls[-1][:2] == (736, 1440)  # both derived from the aspect ratio
 
 
@@ -127,8 +135,7 @@ def test_extreme_aspect_ratio_raises_clear_input_error(tmp_path) -> None:
     for size in [(9600, 32), (8192, 1)]:
         ref = _make_ref(tmp_path, size)
         with pytest.raises(ValueError, match="aspect ratio"):
-            model.generate_image(seed=1, prompt="p", image_paths=[ref], num_inference_steps=1,
-                                 use_kv_cache=False)
+            model.generate_image(seed=1, prompt="p", image_paths=[ref], num_inference_steps=1, use_kv_cache=False)
 
 
 @pytest.mark.fast
@@ -165,8 +172,15 @@ def test_guidance_without_negative_prompt_warns(monkeypatch, caplog, tmp_path) -
     ref = _make_ref(tmp_path, (512, 512))
 
     with caplog.at_level(logging.WARNING, logger="mflux.models.qwen21.variants.edit.qwen_image_21_edit"):
-        model.generate_image(seed=1, prompt="p", image_paths=[ref], num_inference_steps=2,
-                             guidance=4.0, negative_prompt=None, use_kv_cache=False)
+        model.generate_image(
+            seed=1,
+            prompt="p",
+            image_paths=[ref],
+            num_inference_steps=2,
+            guidance=4.0,
+            negative_prompt=None,
+            use_kv_cache=False,
+        )
 
     assert any("negative prompt" in r.message for r in caplog.records)
     assert len(tf.calls) == 2  # two steps, one transformer call each: CFG stayed off
