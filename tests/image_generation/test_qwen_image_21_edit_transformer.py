@@ -1,3 +1,6 @@
+import sys
+from pathlib import Path
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -6,6 +9,18 @@ from mflux.models.common.config import ModelConfig
 from mflux.models.common.config.config import Config
 from mflux.models.qwen21.model.qwen21_text_encoder.qwen21_text_encoder import Qwen21TextEncoder
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_transformer import Qwen21Transformer
+from mflux.models.qwen21.variants.edit import qwen_image_21_edit
+
+
+class _FakeCtx:
+    def before_loop(self, latents): pass
+    def in_loop(self, t, latents, **kw): pass
+    def after_loop(self, latents): pass
+    def interruption(self, t, latents): pass
+
+
+class _FakeCallbacks:
+    def start(self, **kw): return _FakeCtx()
 
 
 @pytest.mark.fast
@@ -77,3 +92,91 @@ def test_edit_path_matches_t2i_path_without_condition_images() -> None:
     out_edit = transformer.__call_edit__(t=0, config=config, target_latents=latents, layout=[("text", text)])
 
     np.testing.assert_array_equal(np.array(out_t2i.astype(mx.float32)), np.array(out_edit.astype(mx.float32)))
+
+
+@pytest.mark.fast
+def test_kv_cache_matches_uncached_with_two_references() -> None:
+    # The cached decode must reproduce a fresh uncached pass at the same step, on a
+    # layout with two reference blocks of different shapes and a trailing text run.
+    transformer = Qwen21Transformer(num_layers=2)
+    config = Config(
+        width=64,
+        height=64,
+        guidance=1.0,
+        scheduler="linear",
+        image_path=None,
+        image_strength=None,
+        model_config=ModelConfig.qwen_image_21(),
+        num_inference_steps=4,
+    )
+    rng = np.random.default_rng(11)
+    text_a = mx.array(rng.standard_normal((1, 5, 4096)).astype(np.float32)).astype(mx.bfloat16)
+    text_b = mx.array(rng.standard_normal((1, 7, 4096)).astype(np.float32)).astype(mx.bfloat16)
+    ref_a = mx.array(rng.standard_normal((1, 4, 64)).astype(np.float32)).astype(mx.bfloat16)  # (2,2) latent grid
+    ref_b = mx.array(rng.standard_normal((1, 3, 64)).astype(np.float32)).astype(mx.bfloat16)  # (1,3) latent grid
+    layout = [("text", text_a), ("image", ref_a, (2, 2)), ("text", text_b), ("image", ref_b, (1, 3))]
+    lat_first = mx.array(rng.standard_normal((1, 16, 64)).astype(np.float32)).astype(mx.bfloat16)  # 4x4 grid
+    lat_other = mx.array(rng.standard_normal((1, 16, 64)).astype(np.float32)).astype(mx.bfloat16)
+
+    kv_cache = [None] * len(transformer.transformer_blocks)
+    out_extract = transformer.__call_edit__(
+        t=0, config=config, target_latents=lat_first, layout=layout,
+        kv_cache=kv_cache, kv_cache_mode="extract",
+    )
+    out_cached = transformer.__call_edit__(
+        t=1, config=config, target_latents=lat_other, layout=layout,
+        kv_cache=kv_cache, kv_cache_mode="cached",
+    )
+    out_fresh = transformer.__call_edit__(
+        t=1, config=config, target_latents=lat_other, layout=layout,
+    )
+    mx.eval(out_cached)
+
+    diff = np.abs(np.array(out_cached.astype(mx.float32)) - np.array(out_fresh.astype(mx.float32)))
+    assert diff.max() < 5e-2  # bf16: same trajectory, reduction order only
+
+
+@pytest.mark.fast
+def test_cli_auto_dimensions_and_scale_factors(monkeypatch, tmp_path) -> None:
+    # No dimension flags: width/height must stay None so generate_image derives its
+    # ~1MP target from the last condition image. Explicit ints and explicit scale
+    # factors must keep working.
+    import sys
+    from types import SimpleNamespace
+
+    from PIL import Image as PILImage
+
+    from mflux.models.qwen21.cli import qwen21_edit_generate as cli
+
+    src = tmp_path / "ref.png"
+    PILImage.new("RGB", (4032, 3024), (120, 60, 30)).save(src)
+
+    captured = {}
+
+    class FakeModel:
+        def __init__(self, **kwargs):
+            self.callbacks = SimpleNamespace(register=lambda *a, **kw: None)
+            captured["init"] = kwargs
+        def generate_image(self, **kwargs):
+            captured["gen"] = kwargs
+            return SimpleNamespace(save=lambda **kw: None)
+
+    monkeypatch.setattr(cli, "QwenImage21Edit", FakeModel)
+
+    def run(extra):
+        captured.clear()
+        monkeypatch.setattr(sys, "argv", [
+            "mflux-generate-qwen-2.1-edit", "--image-paths", str(src), "--prompt", "p",
+            "--output", str(tmp_path / "out_{seed}.png"), *extra,
+        ])
+        cli.main()
+        return captured["gen"]
+
+    gen = run([])
+    assert gen["width"] is None and gen["height"] is None  # auto stays derived
+
+    gen = run(["--width", "512", "--height", "512"])
+    assert gen["width"] == 512 and gen["height"] == 512
+
+    gen = run(["--width", "0.5x", "--height", "0.5x"])
+    assert (gen["width"], gen["height"]) == (2016, 1504)  # DimensionResolver rounds to /32

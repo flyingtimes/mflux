@@ -168,7 +168,7 @@ class Qwen21TextEncoder(nn.Module):
         # Scatter the vision embeds into the embedding sequence in order.
         mask_flat = image_mask[0]
         gather_index = mx.cumsum(mask_flat.astype(mx.int32)) - 1  # k-th True -> embed k
-        gathered = image_embeds[gather_index]
+        gathered = image_embeds[gather_index].astype(hidden_states.dtype)
         keep = mask_flat[:, None]  # (seq_len, 1)
         hidden_states = mx.where(keep[None, :, :], gathered[None, :, :], hidden_states)
         positions = Qwen21TextEncoder.build_mrope_positions(input_ids, image_mask, image_grid_thw)
@@ -187,7 +187,7 @@ class Qwen21TextEncoder(nn.Module):
             if layer_index < len(deepstack_embeds):
                 # inject at image positions only: expand the (n_image, hidden) deepstack
                 # features to full sequence length via the same gather index
-                ds_full = deepstack_embeds[layer_index][gather_index]
+                ds_full = deepstack_embeds[layer_index][gather_index].astype(hidden_states.dtype)
                 hidden_states = mx.where(keep[None, :, :], (hidden_states[0] + ds_full)[None, :, :], hidden_states)
 
         return hidden_states, image_mask

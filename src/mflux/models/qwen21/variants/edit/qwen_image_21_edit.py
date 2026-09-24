@@ -17,6 +17,7 @@ from mflux.models.qwen21.model.qwen21_vae.qwen21_vae import Qwen21VAE
 from mflux.models.qwen21.qwen21_edit_initializer import Qwen21EditInitializer
 from mflux.models.qwen21.tokenizer.qwen21_image_processor import Qwen21ImageProcessor
 from mflux.utils.exceptions import StopImageGenerationException
+from mflux.utils.exif_orientation import open_oriented
 from mflux.utils.generated_image import GeneratedImage
 from mflux.utils.image_util import ImageUtil
 
@@ -62,7 +63,9 @@ class QwenImage21Edit(nn.Module):
         use_kv_cache: bool = True,
     ) -> GeneratedImage:
         # Normalize inputs to PIL up front (same normalization order as the reference).
-        images = [img if isinstance(img, Image.Image) else Image.open(img) for img in image_paths]
+        # open_oriented applies the file's EXIF Orientation tag so a portrait JPEG stored
+        # landscape is encoded the way it displays; RGBA mode is preserved for the VAE.
+        images = [open_oriented(img if isinstance(img, Image.Image) else img) for img in image_paths]
 
         # Output size derives from the last condition image's aspect ratio unless given.
         last_ratio = images[-1].size[0] / images[-1].size[1]
