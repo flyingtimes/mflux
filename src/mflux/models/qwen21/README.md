@@ -100,7 +100,9 @@ mflux-generate-qwen-2.1-edit \
 
 RGBA condition images keep their alpha for the VAE (edit masks); the vision encoder sees a
 white-composited copy. Output dimensions default to the last condition image's aspect ratio
-at ~1MP unless `--width`/`--height` are given.
+at ~1MP; passing `--width`/`--height` explicitly keeps the given axis and derives only the
+missing one (floored to /16 multiples like everywhere in mflux). Condition aspect ratios
+beyond 200:1 are rejected up front — the vision encoder cannot process them.
 
 ### Prefix KV cache
 

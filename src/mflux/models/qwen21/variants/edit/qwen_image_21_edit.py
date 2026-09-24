@@ -1,10 +1,10 @@
+import logging
 from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from PIL import Image
-from tqdm import tqdm
 
 from mflux.models.common.config import ModelConfig
 from mflux.models.common.config.config import Config
@@ -20,6 +20,8 @@ from mflux.utils.exceptions import StopImageGenerationException
 from mflux.utils.exif_orientation import open_oriented
 from mflux.utils.generated_image import GeneratedImage
 from mflux.utils.image_util import ImageUtil
+
+logger = logging.getLogger(__name__)
 
 
 class QwenImage21Edit(nn.Module):
@@ -67,10 +69,29 @@ class QwenImage21Edit(nn.Module):
         # landscape is encoded the way it displays; RGBA mode is preserved for the VAE.
         images = [open_oriented(img if isinstance(img, Image.Image) else img) for img in image_paths]
 
-        # Output size derives from the last condition image's aspect ratio unless given.
-        last_ratio = images[-1].size[0] / images[-1].size[1]
-        if width is None or height is None:
-            width, height = self._calculate_dimensions(output_resolution * output_resolution, last_ratio)
+        # 1. Resize every condition image to its own area-normalized, /32-aligned size.
+        # The vision encoder rejects sequences beyond a 200:1 aspect ratio; the bounds
+        # are checked here, on the rounded dimensions that actually reach it, so an
+        # extreme panorama fails with a clear input error instead of a ValueError from
+        # deep inside preprocessing (a ratio so extreme also rounds a side to 0).
+        resized_images: list[Image.Image] = []
+        ref_shapes: list[tuple[int, int]] = []  # latent-grid (h, w) per image
+        for img in images:
+            ratio = img.size[0] / img.size[1]
+            w32, h32 = self._calculate_dimensions(output_resolution * output_resolution, ratio)
+            if min(w32, h32) < 32 or max(w32, h32) / min(w32, h32) > 200:
+                raise ValueError(
+                    f"condition image {img.size} (aspect ratio {ratio:.1f}) is outside the "
+                    f"supported 200:1 range once rounded to /32 multiples ({w32}x{h32})"
+                )
+            resized = img.resize((w32, h32), Image.BICUBIC) if img.size != (w32, h32) else img
+            resized_images.append(resized)
+            ref_shapes.append((h32 // 16, w32 // 16))
+
+        # Output size: an explicitly passed axis is honored, a missing one derives from
+        # the last condition image's aspect ratio (per-axis, like the reference pipeline).
+        width = width if width is not None else ref_shapes[-1][1] * 16
+        height = height if height is not None else ref_shapes[-1][0] * 16
 
         config = Config(
             width=width,
@@ -82,19 +103,8 @@ class QwenImage21Edit(nn.Module):
             model_config=self.model_config,
             num_inference_steps=num_inference_steps,
         )
-
         latents = Qwen21LatentCreator.create_noise(seed=seed, height=config.height, width=config.width)
         latents = latents.astype(ModelConfig.precision)
-
-        # 1. Resize every condition image to its own area-normalized, /32-aligned size.
-        resized_images: list[Image.Image] = []
-        ref_shapes: list[tuple[int, int]] = []  # latent-grid (h, w) per image
-        for img in images:
-            ratio = img.size[0] / img.size[1]
-            w32, h32 = self._calculate_dimensions(output_resolution * output_resolution, ratio)
-            resized = img.resize((w32, h32), Image.BICUBIC) if img.size != (w32, h32) else img
-            resized_images.append(resized)
-            ref_shapes.append((h32 // 16, w32 // 16))
 
         # 2. Vision path: RGBA is composited over white for the vision encoder only.
         vision_images = []
@@ -123,7 +133,6 @@ class QwenImage21Edit(nn.Module):
 
         # 4. Encode prompt + condition images with the Qwen3-VL encoder into the
         # template-ordered run layout the transformer consumes.
-        time_steps = tqdm(range(len(config.scheduler.timesteps)))
         prompt_layout = self._encode_prompt_with_images(
             prompt=prompt,
             pixel_values=pixel_values,
@@ -134,6 +143,11 @@ class QwenImage21Edit(nn.Module):
             text_encoder=self.text_encoder,
         )
         negative_prompt_layout = None
+        if config.guidance > 1.0 and not negative_prompt:
+            logger.warning(
+                f"guidance={config.guidance} has no effect without a negative prompt; "
+                "pass negative_prompt to enable classifier-free guidance"
+            )
         do_true_cfg = config.guidance > 1.0 and bool(negative_prompt)
         if do_true_cfg:
             negative_prompt_layout = self._encode_prompt_with_images(
@@ -197,7 +211,7 @@ class QwenImage21Edit(nn.Module):
             seed=seed,
             prompt=prompt,
             quantization=self.bits,
-            generation_time=time_steps.format_dict["elapsed"],
+            generation_time=config.time_steps.format_dict["elapsed"],
             negative_prompt=negative_prompt,
             image_paths=image_paths if not isinstance(image_paths[0], Image.Image) else None,
         )
