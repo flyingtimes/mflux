@@ -2,15 +2,18 @@ import argparse
 from pathlib import Path
 
 from mflux.callbacks.callback_manager import CallbackManager
-from mflux.cli.parser.parsers import CommandLineParser
+from mflux.cli.parser.parsers import CommandLineParser, lora_init_kwargs_from_args
 from mflux.models.common.resolution.config_resolution import ConfigResolution
 from mflux.models.qwen21.latent_creator.qwen21_latent_creator import Qwen21LatentCreator
+from mflux.models.qwen21.model.qwen21_scheduler import ViggleTurboScheduler
 from mflux.models.qwen21.variants.edit.qwen_image_21_edit import QwenImage21Edit
 from mflux.utils.dimension_resolver import DimensionResolver
 from mflux.utils.exceptions import PromptFileReadError, StopImageGenerationException
 from mflux.utils.prompt_util import PromptUtil
 
 DEFAULT_MODEL = "qwen-image-2.1"
+
+TURBO_SIGMA_NODES = len(ViggleTurboScheduler.SIGMA_NODES)
 
 
 def build_parser() -> CommandLineParser:
@@ -19,6 +22,7 @@ def build_parser() -> CommandLineParser:
     parser.add_model_arguments(require_model_arg=False, default_model=DEFAULT_MODEL)
     parser.add_image_generator_arguments(supports_metadata_config=True, supports_dimension_scale_factor=True)
     parser.add_image_paths_arguments()
+    parser.add_lora_arguments()
     parser.add_output_arguments()
     parser.add_argument(
         "--mask-image",
@@ -90,8 +94,28 @@ def validate_args(parser: CommandLineParser, args) -> None:
         parser.error(f"--mask-image not found: {args.mask_image}")
     if not 0.0 < args.strength <= 1.0:
         parser.error(f"--strength must be in (0, 1], got {args.strength}")
-    if args.scheduler != "linear":
-        parser.error("Qwen-Image-2.1 editing currently supports the default linear Euler scheduler only.")
+    if args.scheduler not in ("linear", "viggle_turbo"):
+        parser.error(
+            f"Qwen-Image-2.1 editing supports the default linear Euler scheduler or "
+            f"'viggle_turbo' (6-step distilled LoRA), got {args.scheduler!r}"
+        )
+    if args.scheduler == "viggle_turbo" and args.steps != TURBO_SIGMA_NODES:
+        parser.error(
+            f"--scheduler viggle_turbo samples the distilled LoRA on its fixed sigma nodes; "
+            f"use --steps {TURBO_SIGMA_NODES}, got {args.steps}"
+        )
+    if args.scheduler == "viggle_turbo":
+        if not args.lora_paths:
+            print(
+                "⚠️  --scheduler viggle_turbo without --lora runs the BASE model on 6 nodes; "
+                "pass the distilled adapter for turbo results."
+            )
+        if args.use_step_cache:
+            print(
+                "⚠️  --use-step-cache amortizes across nearby steps and is tuned for the 40-step "
+                "base schedule; with 6 turbo steps it can only skip the blocks it just ran. "
+                "Consider leaving it off."
+            )
     if args.rgba_output and Path(str(args.output)).suffix.lower() not in (".png", ".webp", ".tif", ".tiff"):
         parser.error("--rgba-output needs a PNG, WebP or TIFF --output to retain transparency.")
     if args.guidance is not None and args.guidance < 1.0:
@@ -121,6 +145,7 @@ def main():
         quantize=args.quantize,
         model_path=args.model_path,
         model_config=model_config,
+        **lora_init_kwargs_from_args(args),
     )
 
     memory_saver = CallbackManager.register_callbacks(
