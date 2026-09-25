@@ -67,12 +67,48 @@ def build_parser() -> CommandLineParser:
         default=0,
         help="Regenerate with a new seed when verification fails, at most this many times.",
     )
+    parser.add_argument(
+        "--rgba-output",
+        action="store_true",
+        help="Keep the decoder's alpha channel and save RGBA (transparent stickers); "
+        "requires a PNG/WebP/TIFF --output.",
+    )
     return parser
+
+
+def validate_args(parser: CommandLineParser, args) -> None:
+    """Cheap checks that must fail BEFORE the ~33 GB model load."""
+    image_paths = args.image_paths or []
+    if not image_paths:
+        parser.error("at least one --image-paths image is required")
+    if len(image_paths) > 10:
+        parser.error(f"Qwen-Image-2.1 supports at most 10 reference images, got {len(image_paths)}")
+    missing = [p for p in image_paths if not Path(p).exists()]
+    if missing:
+        parser.error(f"condition image(s) not found: {missing}")
+    if args.mask_image is not None and not Path(args.mask_image).exists():
+        parser.error(f"--mask-image not found: {args.mask_image}")
+    if not 0.0 < args.strength <= 1.0:
+        parser.error(f"--strength must be in (0, 1], got {args.strength}")
+    if args.scheduler != "linear":
+        parser.error("Qwen-Image-2.1 editing currently supports the default linear Euler scheduler only.")
+    if args.rgba_output and Path(str(args.output)).suffix.lower() not in (".png", ".webp", ".tif", ".tiff"):
+        parser.error("--rgba-output needs a PNG, WebP or TIFF --output to retain transparency.")
+    if args.guidance is not None and args.guidance < 1.0:
+        parser.error(f"--guidance must be >= 1.0, got {args.guidance}")
+    if args.steps < 1:
+        parser.error(f"--steps must be >= 1, got {args.steps}")
+    # plain-int dimensions are floored to /16 by the config; flag clearly wrong values
+    dims_specified = CommandLineParser._option_was_provided("--width", "--height")
+    if dims_specified and isinstance(args.width, int) and isinstance(args.height, int):
+        if args.width < 32 or args.height < 32:
+            parser.error(f"--width/--height must be >= 32, got {args.width}x{args.height}")
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    validate_args(parser, args)
 
     model_config = ConfigResolution.resolve_restricted(
         args.model,
@@ -121,6 +157,7 @@ def main():
                 enhance_prompt=args.enhance_prompt,
                 verify=args.verify,
                 verify_retries=args.verify_retries,
+                rgba_output=args.rgba_output,
             )
             if getattr(image, "verification", None):
                 print(f"verification: {image.verification}")

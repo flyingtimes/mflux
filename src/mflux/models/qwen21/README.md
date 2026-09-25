@@ -102,7 +102,10 @@ RGBA condition images keep their alpha for the VAE (edit masks); the vision enco
 white-composited copy. Output dimensions default to the last condition image's aspect ratio
 at ~1MP; passing `--width`/`--height` explicitly keeps the given axis and derives only the
 missing one (floored to /16 multiples like everywhere in mflux). Condition aspect ratios
-beyond 200:1 are rejected up front — the vision encoder cannot process them.
+beyond 200:1 are rejected up front — the vision encoder cannot process them. At most 10
+condition images are supported (matching the reference pipeline). Invalid arguments fail
+before the model loads. `--rgba-output` keeps the decoder's alpha channel for transparent
+output (PNG/WebP/TIFF only).
 
 ### Prefix KV cache
 

@@ -72,6 +72,7 @@ class QwenImage21Edit(nn.Module):
         enhance_prompt: bool = False,
         verify: bool = False,
         verify_retries: int = 0,
+        rgba_output: bool = False,
     ) -> GeneratedImage:
         # Normalize inputs to PIL up front (same normalization order as the reference).
         # open_oriented applies the file's EXIF Orientation tag so a portrait JPEG stored
@@ -80,6 +81,8 @@ class QwenImage21Edit(nn.Module):
 
         if not 0.0 < strength <= 1.0:
             raise ValueError(f"strength must be in (0, 1], got {strength}")
+        if len(images) > 10:
+            raise ValueError(f"Qwen-Image-2.1 supports at most 10 condition images, got {len(images)}")
 
         # 0. Optional prompt rewriting: the official Qwen-Image-2.1 serving recipe
         # rewrites terse edit instructions into detailed descriptions with a VL model
@@ -279,10 +282,13 @@ class QwenImage21Edit(nn.Module):
         ctx.after_loop(latents)
 
         latents = Qwen21LatentCreator.unpack_latents(latents=latents, height=config.height, width=config.width)
-        decoded = VAEUtil.decode(vae=self.vae, latent=latents, tiling_config=self.tiling_config)
+        decoded = VAEUtil.decode(vae=self.vae, latent=latents, tiling_config=self.tiling_config, keep_alpha=rgba_output)
         if inpaint_mask is not None:
             keep = np.asarray(inpaint_mask, dtype=np.float32) / 255.0  # (H, W): 1 = repaint
             original = np.asarray(blend_image, dtype=np.float32).transpose(2, 0, 1)[None] / 127.5 - 1.0
+            if rgba_output and original.shape[1] == 3:
+                # composite over the same channel count the decoder produced
+                original = np.concatenate([original, np.ones_like(original[:, :1])], axis=1)
             repaint = mx.array(keep[None, None, :, :])
             original = mx.array(original)
             # float32 compositing keeps unmasked pixels exactly the original

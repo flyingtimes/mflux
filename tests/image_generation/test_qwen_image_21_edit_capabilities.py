@@ -1,6 +1,5 @@
 """Weight-free tests for edit strength, prompt rewriting, and output verification."""
 
-
 import mlx.core as mx
 import numpy as np
 import pytest
