@@ -216,7 +216,8 @@ class QwenImage21Edit(nn.Module):
         if not verify:
             return image
         # Coarse self-check with the in-memory Qwen3-VL; a failed verdict retries with the
-        # next seed, each retry paying a full generation (hence opt-in).
+        # next seed, each retry paying a full generation (hence opt-in). Retries reuse this
+        # run's mask and rewritten prompt: both are deterministic per source.
         verification = self._verify_output(original_prompt, source, image.image)
         retries = 0
         while not verification.get("verified") and retries < verify_retries:
@@ -224,7 +225,7 @@ class QwenImage21Edit(nn.Module):
             logger.info("verify failed (%s); retry %d/%d", verification, retries, verify_retries)
             retry_image = self.generate_image(
                 seed=seed + retries,
-                prompt=original_prompt,
+                prompt=prompt,
                 num_inference_steps=num_inference_steps,
                 height=height,
                 width=width,
@@ -233,12 +234,14 @@ class QwenImage21Edit(nn.Module):
                 image_paths=image_paths,
                 output_resolution=output_resolution,
                 use_kv_cache=use_kv_cache,
-                mask_image=mask_image,
-                auto_mask=auto_mask,
+                mask_image=inpaint_mask,
                 strength=strength,
                 use_step_cache=use_step_cache,
                 step_cache_threshold=step_cache_threshold,
-                enhance_prompt=enhance_prompt,
+            )
+            # the retry got the resolved mask and prompt; record how they were derived
+            retry_image.generation_parameters.update(
+                {key: parameters[key] for key in ("auto_mask", "original_prompt") if key in parameters}
             )
             retry_verification = self._verify_output(original_prompt, source, retry_image.image)
             if retry_verification.get("verified"):
@@ -276,8 +279,7 @@ class QwenImage21Edit(nn.Module):
         if not auto_mask.strip():
             raise ValueError("auto_mask must name an object to locate.")
         reply = self._vision_reply(QwenImage21Grounding.GROUNDING_PROMPT.format(query=auto_mask), [source], 64)
-        # Qwen3-VL grounds in 0-1000 coordinates relative to the shown image
-        bbox = QwenImage21Grounding.parse_bbox(reply, source.size, normalized_1000=True)
+        bbox = QwenImage21Grounding.parse_bbox(reply)
         if bbox is None:
             raise ValueError(
                 f"auto_mask could not locate {auto_mask!r} in the first reference image "

@@ -110,30 +110,15 @@ class QwenImage21Grounding:
         return None
 
     @staticmethod
-    def parse_bbox(
-        text: str, image_size: tuple[int, int], normalized_1000: bool = False
-    ) -> tuple[float, float, float, float] | None:
-        # Returns (x1, y1, x2, y2) as fractions of image_size, or None when the reply
-        # carries no plausible box. normalized_1000 fixes the scale to the Qwen3-VL
-        # 0-1000 grounding convention. Otherwise the scale is inferred: values <= 2 are
-        # already fractions; values beyond the shown image's size follow the 0-1000
-        # convention; anything else is absolute pixels of the shown image.
-        width, height = image_size
+    def parse_bbox(text: str) -> tuple[float, float, float, float] | None:
+        # Returns (x1, y1, x2, y2) as fractions of the shown image, or None when the reply
+        # carries no plausible box. Qwen3-VL grounds in 0-1000 coordinates relative to the
+        # shown image, whatever its pixel size.
         for match in _BBOX_PATTERN.finditer(text):
-            x1, y1, x2, y2 = (float(v) for v in match.groups())
-            if x2 <= x1 or y2 <= y1:
+            x1, y1, x2, y2 = (float(v) / 1000.0 for v in match.groups())
+            if x2 <= x1 or y2 <= y1 or max(x1, y1, x2, y2) > 1.5:
                 continue
-            if normalized_1000:
-                box = (x1 / 1000.0, y1 / 1000.0, x2 / 1000.0, y2 / 1000.0)
-            elif max(x1, y1, x2, y2) <= 2.0:
-                box = (x1, y1, x2, y2)
-            elif max(x1, y1, x2, y2) > max(width, height):
-                box = (x1 / 1000.0, y1 / 1000.0, x2 / 1000.0, y2 / 1000.0)
-            else:
-                box = (x1 / width, y1 / height, x2 / width, y2 / height)
-            if max(box) > 1.5:
-                continue
-            clamped = tuple(min(max(v, 0.0), 1.0) for v in box)
+            clamped = tuple(min(max(v, 0.0), 1.0) for v in (x1, y1, x2, y2))
             if (clamped[2] - clamped[0]) * (clamped[3] - clamped[1]) < 1e-4:
                 continue
             return clamped

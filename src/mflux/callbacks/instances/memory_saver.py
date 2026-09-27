@@ -17,9 +17,12 @@ class MemorySaver(BeforeLoopCallback, InLoopCallback, AfterLoopCallback):
         cache_limit_bytes: int | None = 1000**3,
         args=None,
         num_seeds: int = 1,
+        keep_text_encoder: bool = False,
     ):
         self.model = model
         self.keep_transformer = keep_transformer
+        # For features that call the text encoder after the loop (Qwen-Image-2.1 edit --verify).
+        self.keep_text_encoder = keep_text_encoder
         self.peak_memory: int = 0
         self._num_seeds = num_seeds
         if cache_limit_bytes is not None:
@@ -44,7 +47,7 @@ class MemorySaver(BeforeLoopCallback, InLoopCallback, AfterLoopCallback):
         # (Flux1 caches embeddings so encoder isn't needed for subsequent seeds;
         #  Flux2 re-encodes each call and has no prompt_cache — keep encoder for multi-seed)
         has_cached_embeds = hasattr(self.model, "prompt_cache") and prompt in (self.model.prompt_cache or {})
-        if self._num_seeds <= 1 or has_cached_embeds:
+        if not self.keep_text_encoder and (self._num_seeds <= 1 or has_cached_embeds):
             self._delete_text_encoders()
 
     def call_in_loop(

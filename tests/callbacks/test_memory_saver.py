@@ -86,3 +86,13 @@ def test_call_after_loop_clears_cache_when_keep_transformer_true():
     mock_gc_collect.assert_called_once()
     mock_clear_cache.assert_called_once()
     assert model.transformer is not None
+
+
+@pytest.mark.fast
+def test_call_before_loop_keeps_text_encoder_when_asked():
+    model = _EncoderModel()
+    saver = MemorySaver(model=model, cache_limit_bytes=None, num_seeds=1, keep_text_encoder=True)
+
+    saver.call_before_loop(seed=1, prompt="a cat", latents=None, config=_config())
+
+    assert model.text_encoder is not None

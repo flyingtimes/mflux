@@ -85,6 +85,8 @@ class CallbackManager:
         CallbackManager._apply_vae_tiling(args, model)
         seeds = getattr(args, "seed", []) or []
         num_seeds = len(seeds) if seeds else 1
+        # --verify reads the image back with the text encoder after the loop
+        keep_text_encoder = bool(getattr(args, "verify", False))
         if args.low_ram:
             images = getattr(args, "image_path", [])
             if not isinstance(images, list):
@@ -96,6 +98,7 @@ class CallbackManager:
                 cache_limit_bytes=cache_limit_bytes or 1000**3,
                 args=args,
                 num_seeds=num_seeds,
+                keep_text_encoder=keep_text_encoder,
             )
         else:
             # Always evict text encoders after encoding — they are never needed post-encode
@@ -110,7 +113,11 @@ class CallbackManager:
             # nothing on a path that never calls the VAE.
             keep_transformer = num_seeds > 1 or not getattr(args, "pid_decode", False)
             memory_saver = MemorySaver(
-                model=model, keep_transformer=keep_transformer, cache_limit_bytes=None, num_seeds=num_seeds
+                model=model,
+                keep_transformer=keep_transformer,
+                cache_limit_bytes=None,
+                num_seeds=num_seeds,
+                keep_text_encoder=keep_text_encoder,
             )
             if cache_limit_bytes is not None:
                 mx.set_cache_limit(cache_limit_bytes)

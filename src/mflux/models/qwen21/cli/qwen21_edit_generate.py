@@ -121,6 +121,8 @@ def validate_edit_args(parser: CommandLineParser, args, paths: list) -> None:
         parser.error(f"--strength must be in (0, 1], got {args.strength}")
     if args.verify_retries < 0:
         parser.error(f"--verify-retries must be >= 0, got {args.verify_retries}")
+    if args.use_step_cache and not args.use_kv_cache:
+        parser.error("--use-step-cache needs --use-kv-cache (the default)")
 
 
 def main() -> None:

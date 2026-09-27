@@ -1,4 +1,5 @@
 import sys
+from argparse import Namespace
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -8,6 +9,7 @@ import torch
 from PIL import Image
 from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 
+from mflux.callbacks.callback_manager import CallbackManager
 from mflux.callbacks.callback_registry import CallbackRegistry
 from mflux.models.common.config import ModelConfig
 from mflux.models.qwen21.cli import qwen21_edit_generate as cli
@@ -157,6 +159,63 @@ def test_verify_retries_until_the_check_passes(tmp_path):
     assert len(model.transformer.calls) == 8  # original + one retry
 
 
+def test_verify_retries_reuse_the_mask_and_rewritten_prompt(tmp_path):
+    prompts, instructions = [], []
+    model = _stub_model(prompts)
+    replies = {
+        "Outline": '[{"bbox_2d": [0, 0, 500, 1000], "label": "x"}]',
+        "You": '{"rewritten_prompt": "a detailed edit"}',
+    }
+    verdicts = [
+        '{"instruction_applied": false, "outside_unchanged": true}',
+        '{"instruction_applied": true, "outside_unchanged": true}',
+    ]
+
+    def reply(instruction, images, tokens):
+        instructions.append(instruction.split()[0])
+        return verdicts.pop(0) if instruction.startswith("<image1> is the original") else replies[instructions[-1]]
+
+    model._vision_reply = reply
+    image = _generate(model, tmp_path, auto_mask="the left half", enhance_prompt=True, verify=True, verify_retries=2)
+    assert image.verification["retries"] == 1
+    assert instructions.count("Outline") == 1 and instructions.count("You") == 1  # grounding + rewrite once
+    assert prompts == ["a detailed edit", "a detailed edit"]
+    assert image.generation_parameters["auto_mask"] == "the left half"
+    assert image.generation_parameters["original_prompt"] == "edit"
+    pixels = np.asarray(image.image.convert("RGB")).astype(int)
+    np.testing.assert_allclose(pixels[32, 56], SOURCE_RGB, atol=2)  # the retry kept the mask
+
+
+@pytest.mark.parametrize("verify", [True, False])
+def test_verify_survives_the_cli_memory_saver(tmp_path, verify):
+    # The CLI always registers MemorySaver, which frees the text encoder before the loop
+    # on single-seed runs; --verify reads the image back with it afterwards.
+    model = _stub_model()
+    model.processor = type(
+        "Processor",
+        (),
+        {
+            "__call__": staticmethod(
+                lambda text, images, return_tensors: {
+                    "input_ids": np.zeros((1, 3), np.int32),
+                    "pixel_values": np.zeros((4, 8)),
+                    "image_grid_thw": [[1, 2, 2]],
+                }
+            ),
+            "tokenizer": SimpleNamespace(decode=lambda ids: '{"instruction_applied": true, "outside_unchanged": true}'),
+            "image_processor": SimpleNamespace(size={"shortest_edge": 0, "longest_edge": 1e12}),
+        },
+    )()
+    model.text_encoder = SimpleNamespace(generate=lambda *a, **k: [1])
+    CallbackManager._register_memory_saver(Namespace(low_ram=False, seed=[42], verify=verify), model)
+    if verify:
+        assert _generate(model, tmp_path, verify=True).verification["verified"] is True
+    else:
+        # without --verify the saver still frees the encoder, which a verify call would need
+        _generate(model, tmp_path)
+        assert model.text_encoder is None
+
+
 @pytest.mark.parametrize(
     "kwargs,match",
     [
@@ -243,15 +302,14 @@ def test_generation_head_is_optional_when_loading():
         QwenImage21Initializer._validate_weights("vae", module, {"embed.weight": mx.zeros((2, 2))})
 
 
-def test_grounding_parse_bbox_regimes():
+def test_grounding_parse_bbox_reads_0_1000_coordinates():
     parse = QwenImage21Grounding.parse_bbox
-    assert parse('[{"bbox_2d": [10, 20, 110, 80]}]', (200, 100)) == (0.05, 0.2, 0.55, 0.8)
-    assert parse("[[0.1, 0.2, 0.6, 0.8]]", (200, 100)) == (0.1, 0.2, 0.6, 0.8)
-    assert parse("[[359, 168, 580, 783]]", (512, 512)) == (0.359, 0.168, 0.58, 0.783)
-    assert parse("[[100, 200, 400, 500]]", (512, 512), normalized_1000=True) == (0.1, 0.2, 0.4, 0.5)
-    assert parse("I cannot see it", (200, 100)) is None
-    assert parse("[[50, 50, 50, 90]]", (200, 100)) is None
-    assert parse("[[10, 20, 1100, 1700]]", (512, 512), normalized_1000=True) is None
+    assert parse('```json\n[{"bbox_2d": [100, 200, 400, 500], "label": "x"}]\n```') == (0.1, 0.2, 0.4, 0.5)
+    assert parse("[[305, 234, 432, 372]]") == (0.305, 0.234, 0.432, 0.372)  # real reply, puffin beak
+    assert parse("[[900, 900, 1020, 1010]]") == (0.9, 0.9, 1.0, 1.0)  # slight overshoot clamps
+    assert parse("I cannot see it") is None
+    assert parse("[[50, 50, 50, 90]]") is None  # degenerate
+    assert parse("[[10, 20, 1100, 1700]]") is None  # far out of range
 
 
 def test_grounding_parse_rewrite_and_verification():
@@ -276,6 +334,7 @@ def test_grounding_masks():
         (["--auto-mask", "shirt"], "need at least one --image-paths"),
         (["--strength", "0"], "strength"),
         (["--verify-retries", "-1"], "verify-retries"),
+        (["--use-step-cache", "--no-use-kv-cache"], "--use-step-cache needs --use-kv-cache"),
     ],
 )
 def test_invalid_edit_flags_fail_before_loading(monkeypatch, capsys, argv, match):

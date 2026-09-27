@@ -55,3 +55,16 @@ def test_register_memory_saver_uses_mlx_cache_limit_for_low_ram_mode():
     assert kwargs["num_seeds"] == 2
     assert kwargs["keep_transformer"] is True
     model.callbacks.register.assert_called_once_with(mocked_memory_saver)
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("low_ram", [False, True])
+def test_register_memory_saver_keeps_text_encoder_for_verify(low_ram):
+    model = SimpleNamespace(callbacks=MagicMock(), tiling_config=None)
+
+    with patch("mflux.callbacks.instances.memory_saver.mx"):
+        verify = CallbackManager._register_memory_saver(Namespace(low_ram=low_ram, seed=[1], verify=True), model)
+        plain = CallbackManager._register_memory_saver(Namespace(low_ram=low_ram, seed=[1]), model)
+
+    assert verify.keep_text_encoder is True
+    assert plain.keep_text_encoder is False
