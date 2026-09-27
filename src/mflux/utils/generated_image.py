@@ -50,6 +50,7 @@ class GeneratedImage:
         init_metadata: dict | None = None,
         pid_decode: bool = False,
         pid_degrade_sigma: float = 0.0,
+        generation_parameters: dict | None = None,
     ):
         self.image = image
         self.model_config = model_config
@@ -78,10 +79,9 @@ class GeneratedImage:
         self.init_metadata = init_metadata
         self.pid_decode = pid_decode
         self.pid_degrade_sigma = pid_degrade_sigma
-        # Optional post-edit self-check result set by callers (edit variant verify):
-        # {"verified": bool, "instruction_applied": bool, "outside_unchanged": bool,
-        #  "retries": int} -- not part of the generation parameters metadata.
-        self.verification = None
+        # Optional post-edit self-check result (Qwen-Image-2.1 edit verify), kept out of the metadata.
+        self.verification: dict | None = None
+        self.generation_parameters = generation_parameters or {}
 
     def get_right_half(self) -> "GeneratedImage":
         # Calculate the coordinates for the right half
@@ -117,6 +117,7 @@ class GeneratedImage:
             init_metadata=self.init_metadata,
             pid_decode=self.pid_decode,
             pid_degrade_sigma=self.pid_degrade_sigma,
+            generation_parameters=self.generation_parameters,
         )
 
     def save(
@@ -265,6 +266,10 @@ class GeneratedImage:
             # gain keys for a flag it doesn't have.
             **({"pid_decode": True, "pid_degrade_sigma": self.pid_degrade_sigma} if self.pid_decode else {}),
         }
+
+        if metadata.keys() & self.generation_parameters.keys():
+            raise ValueError("Model-specific generation parameters cannot override standard metadata fields.")
+        metadata.update(self.generation_parameters)
 
         # If we have initial metadata from a source image, merge it
         if self.init_metadata and (old_exif := self.init_metadata.get("exif")):
