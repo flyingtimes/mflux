@@ -227,6 +227,15 @@ def test_grounding_parse_bbox_absolute_and_fraction() -> None:
 
 
 @pytest.mark.fast
+def test_grounding_parse_bbox_explicit_1000_mode() -> None:
+    # within the shown image's size, inference would read pixels; the explicit mode does not
+    reply = "[[100, 200, 400, 500]]"
+    assert Qwen21Grounding.parse_bbox(reply, (512, 512)) == (100 / 512, 200 / 512, 400 / 512, 500 / 512)
+    assert Qwen21Grounding.parse_bbox(reply, (512, 512), normalized_1000=True) == (0.1, 0.2, 0.4, 0.5)
+    assert Qwen21Grounding.parse_bbox("[[10, 20, 1100, 1700]]", (512, 512), normalized_1000=True) is None
+
+
+@pytest.mark.fast
 def test_grounding_rasterize_puts_box_center_white() -> None:
     mask = Qwen21Grounding.rasterize_mask((0.25, 0.25, 0.75, 0.75), (100, 100))
     array = np.asarray(mask)
@@ -235,12 +244,13 @@ def test_grounding_rasterize_puts_box_center_white() -> None:
 
 
 @pytest.mark.fast
-def test_auto_mask_builds_mask_from_model_reply(tmp_path) -> None:
+@pytest.mark.parametrize("size", [128, 136])  # 136 floors to 128: the mask must follow config
+def test_auto_mask_builds_mask_from_model_reply(tmp_path, size) -> None:
     ref = PILImage.new("RGB", (128, 128), (10, 200, 30))
     model = _stub_model(tmp_path)
     model.transformer = _RecordingTF(latent_tokens=8 * 8)
     model.text_encoder.locate_object = lambda *a, **k: [7, 8, 9]
-    model.tokenizers["qwen21"] = _FakeTokWrap(reply=json.dumps([{"bbox_2d": [32, 32, 96, 96], "label": "x"}]))
+    model.tokenizers["qwen21"] = _FakeTokWrap(reply=json.dumps([{"bbox_2d": [63, 63, 188, 188], "label": "x"}]))
 
     captured = {}
 
@@ -258,15 +268,15 @@ def test_auto_mask_builds_mask_from_model_reply(tmp_path) -> None:
             prompt="p",
             image_paths=[ref],
             num_inference_steps=1,
-            width=128,
-            height=128,
+            width=size,
+            height=size,
             auto_mask="the object",
             use_kv_cache=False,
         )
     finally:
         edit_module.ImageUtil.to_image = orig_to_image
 
-    # reply coords are relative to the 512px grounding feed -> fractions 0.0625..0.1875:
+    # reply coords follow the Qwen3-VL 0-1000 convention -> fractions 0.063..0.188:
     # the repainted spot lands near output pixel (16, 16); the far corner is preserved
     decoded = np.array(captured["decoded_latents"].astype(mx.float32))[0]
     original = np.asarray(ref.resize((128, 128)), dtype=np.float32).transpose(2, 0, 1) / 127.5 - 1.0

@@ -153,8 +153,8 @@ class QwenImage21Edit(nn.Module):
             mask_image=mask_image,
             auto_mask=auto_mask,
             vision_image=vision_images[0],
-            width=width,
-            height=height,
+            width=config.width,
+            height=config.height,
         )
 
         # 3. Pixel path: the VAE encodes full RGBA (the alpha channel can carry edit masks).
@@ -335,6 +335,7 @@ class QwenImage21Edit(nn.Module):
                 step_cache_threshold=step_cache_threshold,
                 strength=strength,
                 enhance_prompt=enhance_prompt,
+                rgba_output=rgba_output,
             )
             retry_verification = self._verify_output(original_prompt, images[0], retry_image.image)
             if retry_verification.get("verified"):
@@ -376,7 +377,7 @@ class QwenImage21Edit(nn.Module):
         )
         reply_ids = self.text_encoder.locate_object(input_ids, pixel_values, grid_thw)
         reply = tokenizer.tokenizer.decode(reply_ids)
-        bbox = Qwen21Grounding.parse_bbox(reply, (feed_width, feed_height))
+        bbox = Qwen21Grounding.parse_bbox(reply, (feed_width, feed_height), normalized_1000=True)
         if bbox is None:
             raise ValueError(
                 f"auto_mask could not locate '{auto_mask}' in the first condition image "

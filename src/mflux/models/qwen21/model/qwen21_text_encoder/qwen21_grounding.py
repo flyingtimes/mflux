@@ -131,18 +131,22 @@ class Qwen21Grounding:
         return None
 
     @staticmethod
-    def parse_bbox(text: str, image_size: tuple[int, int]) -> tuple[float, float, float, float] | None:
+    def parse_bbox(
+        text: str, image_size: tuple[int, int], normalized_1000: bool = False
+    ) -> tuple[float, float, float, float] | None:
         # Returns (x1, y1, x2, y2) as fractions of image_size, or None when the reply
-        # carries no plausible box. Three coordinate regimes exist: values <= 2 are
-        # already fractions; values beyond the shown image's size follow the classic
-        # Qwen-VL 0-1000 normalized convention; anything else is absolute pixels of
-        # the shown image.
+        # carries no plausible box. normalized_1000 fixes the scale to the Qwen3-VL
+        # 0-1000 grounding convention. Otherwise the scale is inferred: values <= 2 are
+        # already fractions; values beyond the shown image's size follow the 0-1000
+        # convention; anything else is absolute pixels of the shown image.
         width, height = image_size
         for match in _BBOX_PATTERN.finditer(text):
             x1, y1, x2, y2 = (float(v) for v in match.groups())
             if x2 <= x1 or y2 <= y1:
                 continue
-            if max(x1, y1, x2, y2) <= 2.0:
+            if normalized_1000:
+                box = (x1 / 1000.0, y1 / 1000.0, x2 / 1000.0, y2 / 1000.0)
+            elif max(x1, y1, x2, y2) <= 2.0:
                 box = (x1, y1, x2, y2)
             elif max(x1, y1, x2, y2) > max(width, height):
                 box = (x1 / 1000.0, y1 / 1000.0, x2 / 1000.0, y2 / 1000.0)
