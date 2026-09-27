@@ -116,6 +116,8 @@ class QwenImage21TextEncoder(nn.Module):
         deepstack = None
         if pixel_values is not None:
             features, deepstack = self.visual(pixel_values.astype(hidden.dtype), image_grid_thw, return_deepstack=True)
+            if features.shape[0] != image_indices.size:
+                raise ValueError("Vision feature count does not match the image placeholders.")
             hidden[:, image_indices] = features.astype(hidden.dtype)[None]
         positions = self.position_ids(input_ids, image_grid_thw)
         rope = model.rotary_emb(hidden, positions)

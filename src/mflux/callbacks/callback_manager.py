@@ -91,7 +91,9 @@ class CallbackManager:
             images = getattr(args, "image_path", [])
             if not isinstance(images, list):
                 images = [images] if images is not None else []
-            keep_transformer = num_seeds > 1 or len(images) > 1
+            # --verify-retries regenerates after the loop, so the transformer must survive it
+            retries = getattr(args, "verify", False) and getattr(args, "verify_retries", 0) > 0
+            keep_transformer = num_seeds > 1 or len(images) > 1 or retries
             memory_saver = MemorySaver(
                 model=model,
                 keep_transformer=keep_transformer,

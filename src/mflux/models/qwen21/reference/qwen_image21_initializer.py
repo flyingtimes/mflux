@@ -76,6 +76,10 @@ class QwenImage21Initializer:
         if name == "text_encoder":
             head = {key for key in missing if QwenImage21WeightDefinition.is_generation_head(key)}
             module.has_generation_head = not head
+            if head:
+                # Drop the unloaded head so it is neither quantized nor re-saved as random weights.
+                module.lm_head = None
+                module.language_model.norm = None
             missing -= head
         unexpected = set(supplied) - set(expected)
         mismatched = [key for key in expected.keys() & supplied.keys() if expected[key].shape != supplied[key].shape]

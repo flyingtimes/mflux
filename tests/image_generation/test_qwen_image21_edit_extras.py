@@ -216,6 +216,24 @@ def test_verify_survives_the_cli_memory_saver(tmp_path, verify):
         assert model.text_encoder is None
 
 
+def test_verify_retries_survive_the_low_ram_memory_saver(tmp_path):
+    # --low-ram frees the transformer after a single-seed loop; a retry regenerates with it.
+    model = _stub_model()
+    replies = [
+        '{"instruction_applied": false, "outside_unchanged": true}',
+        '{"instruction_applied": true, "outside_unchanged": true}',
+    ]
+    model._vision_reply = lambda instruction, images, tokens: replies.pop(0)
+    previous_limit = mx.set_cache_limit(mx.device_info()["memory_size"])
+    try:
+        CallbackManager._register_memory_saver(Namespace(low_ram=True, seed=[42], verify=True, verify_retries=2), model)
+        image = _generate(model, tmp_path, verify=True, verify_retries=2)
+    finally:
+        mx.set_cache_limit(previous_limit)
+    assert image.verification["verified"] is True
+    assert image.verification["retries"] == 1
+
+
 @pytest.mark.parametrize(
     "kwargs,match",
     [
@@ -294,10 +312,14 @@ def test_generation_head_is_optional_when_loading():
     from mflux.models.qwen21.reference.qwen_image21_initializer import QwenImage21Initializer
 
     module = SimpleNamespace(
-        parameters=lambda: {"lm_head": {"weight": mx.zeros((2, 2))}, "embed": {"weight": mx.zeros((2, 2))}}
+        parameters=lambda: {"lm_head": {"weight": mx.zeros((2, 2))}, "embed": {"weight": mx.zeros((2, 2))}},
+        lm_head=object(),
+        language_model=SimpleNamespace(norm=object()),
     )
     QwenImage21Initializer._validate_weights("text_encoder", module, {"embed.weight": mx.zeros((2, 2))})
     assert module.has_generation_head is False
+    # the random head is dropped, so a re-save cannot pass it off as real weights
+    assert module.lm_head is None and module.language_model.norm is None
     with pytest.raises(ValueError, match="missing"):
         QwenImage21Initializer._validate_weights("vae", module, {"embed.weight": mx.zeros((2, 2))})
 
@@ -334,6 +356,7 @@ def test_grounding_masks():
         (["--auto-mask", "shirt"], "need at least one --image-paths"),
         (["--strength", "0"], "strength"),
         (["--verify-retries", "-1"], "verify-retries"),
+        (["--verify-retries", "2"], "--verify-retries needs --verify"),
         (["--use-step-cache", "--no-use-kv-cache"], "--use-step-cache needs --use-kv-cache"),
     ],
 )
