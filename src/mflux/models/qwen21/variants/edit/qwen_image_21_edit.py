@@ -1,4 +1,5 @@
 import json
+import logging
 import shutil
 from pathlib import Path
 
@@ -13,14 +14,18 @@ from mflux.models.common.config.config import Config
 from mflux.models.common.vae.vae_util import VAEUtil
 from mflux.models.common.weights.saving.model_saver import ModelSaver
 from mflux.models.qwen21.reference.latent_creator.qwen_image21_latent_creator import QwenImage21LatentCreator
+from mflux.models.qwen21.reference.model.qwen_image21_text_encoder.grounding import QwenImage21Grounding
 from mflux.models.qwen21.reference.model.qwen_image21_text_encoder.prompt_encoder import QwenImage21PromptEncoder
 from mflux.models.qwen21.reference.model.qwen_image21_transformer.layout import QwenImage21Layout
+from mflux.models.qwen21.reference.model.qwen_image21_transformer.transformer import StepCache
 from mflux.models.qwen21.reference.qwen_image21_initializer import QwenImage21Initializer
 from mflux.models.qwen21.reference.weights.qwen_image21_weight_definition import QwenImage21WeightDefinition
 from mflux.utils.exceptions import StopImageGenerationException
 from mflux.utils.exif_orientation import open_oriented
 from mflux.utils.generated_image import GeneratedImage
 from mflux.utils.image_util import ImageUtil
+
+logger = logging.getLogger(__name__)
 
 
 class QwenImage21Edit(nn.Module):
@@ -42,12 +47,30 @@ class QwenImage21Edit(nn.Module):
         image_paths: list[str | Path] | None = None,
         output_resolution: int = 1024,
         use_kv_cache: bool = True,
+        mask_image: str | Path | Image.Image | None = None,
+        auto_mask: str | None = None,
+        strength: float = 1.0,
+        use_step_cache: bool = False,
+        step_cache_threshold: float = 0.12,
+        enhance_prompt: bool = False,
+        verify: bool = False,
+        verify_retries: int = 0,
     ) -> GeneratedImage:
         image_paths = image_paths or []
         if len(image_paths) > 10:
             raise ValueError("Qwen-Image-2.1 supports at most 10 reference images.")
         QwenImage21LatentCreator.validate_resolution(output_resolution)
+        if not 0 < strength <= 1:
+            raise ValueError(f"strength must be in (0, 1], got {strength}.")
+        if verify_retries < 0:
+            raise ValueError(f"verify_retries must be >= 0, got {verify_retries}.")
+        needs_source = mask_image is not None or auto_mask is not None or strength < 1 or enhance_prompt or verify
+        if needs_source and not image_paths:
+            raise ValueError("mask_image, auto_mask, strength, enhance_prompt and verify need a reference image.")
         images = [open_oriented(path).convert("RGBA") for path in image_paths]
+        # The first reference is the edit source: inpaint blending, strength starts,
+        # prompt rewriting and verification all read it at its own size.
+        source = images[0] if images else None
         ratio = images[-1].width / images[-1].height if images else 1.0
         default_width, default_height = QwenImage21LatentCreator.dimensions(output_resolution, ratio)
         width = default_width if width is None else width
@@ -63,7 +86,17 @@ class QwenImage21Edit(nn.Module):
             width=width,
             height=height,
             guidance=guidance,
+            # strength < 1 skips the first (1 - strength) of the schedule, starting from
+            # the source noised to that sigma instead of pure noise
+            image_path=str(image_paths[0]) if strength < 1 else None,
+            image_strength=1 - strength if strength < 1 else None,
         )
+        original_prompt = prompt
+        if enhance_prompt:
+            prompt = self._rewrite_prompt(prompt, source)
+            logger.info("enhance_prompt: %r -> %r", original_prompt, prompt)
+        # White = repaint, black = preserve; drives per-step latent blending and a final pixel composite.
+        inpaint_mask = self._resolve_mask(mask_image, auto_mask, source, width, height)
         images = [
             image.resize(
                 QwenImage21LatentCreator.dimensions(output_resolution, image.width / image.height),
@@ -94,8 +127,28 @@ class QwenImage21Edit(nn.Module):
         mx.random.seed(seed)
         latents = mx.random.normal((1, 64, 1, height // 16, width // 16)).astype(prompt_embeds.dtype)
         latents = QwenImage21LatentCreator.pack_latents(latents)
+        # Flow matching interpolates x_sigma = src + sigma * (noise - src), so unmasked
+        # tokens can follow the source's own trajectory and strength < 1 can start on it.
+        noise_init = latents
+        blend_image = blend_source = blend_mask = None
+        if inpaint_mask is not None or config.init_time_step > 0:
+            blend_image = source.resize((width, height), Image.Resampling.LANCZOS)
+            pixels = mx.array(np.asarray(blend_image).astype(np.float32) / 127.5 - 1).transpose(2, 0, 1)[None]
+            blend_source = QwenImage21LatentCreator.pack_latents(self.vae.encode(pixels)).astype(latents.dtype)
+        if inpaint_mask is not None:
+            grid = QwenImage21Grounding.to_latent_mask(inpaint_mask, height // 16, width // 16)
+            blend_mask = mx.array(grid.reshape(1, -1, 1)).astype(latents.dtype)
+        if config.init_time_step > 0:
+            sigma_start = config.scheduler.sigmas[config.init_time_step]
+            latents = (blend_source + sigma_start * (noise_init - blend_source)).astype(latents.dtype)
         cache = [] if use_kv_cache else None
         negative_cache = [] if use_kv_cache else None
+        if use_step_cache and not use_kv_cache:
+            logger.warning("use_step_cache needs use_kv_cache; running without step skipping")
+        step_cache = StepCache(step_cache_threshold) if use_step_cache and use_kv_cache else None
+        negative_step_cache = (
+            StepCache(step_cache_threshold) if step_cache is not None and negative is not None else None
+        )
         ctx = self.callbacks.start(seed=seed, prompt=prompt, config=config)
         ctx.before_loop(latents)
         for t in config.time_steps:
@@ -103,15 +156,26 @@ class QwenImage21Edit(nn.Module):
                 model_input = mx.concatenate([condition_latents, latents], axis=1) if conditions else latents
                 # Match diffusers: cast the 0..1000 timestep before dividing by 1000.
                 timestep = (config.scheduler.sigmas[t : t + 1] * 1000).astype(latents.dtype) / 1000
-                noise = self.transformer(model_input, prompt_embeds, timestep, layout, cache)
+                noise = self.transformer(model_input, prompt_embeds, timestep, layout, cache, step_cache=step_cache)
                 if negative is not None:
-                    uncond = self.transformer(model_input, negative[0], timestep, negative_layout, negative_cache)
+                    uncond = self.transformer(
+                        model_input,
+                        negative[0],
+                        timestep,
+                        negative_layout,
+                        negative_cache,
+                        step_cache=negative_step_cache,
+                    )
                     noise = uncond + guidance * (noise - uncond)
                 # The upstream Euler update accumulates in fp32 and casts back afterward.
                 sigma = config.scheduler.sigmas
                 latents = (latents.astype(mx.float32) + (sigma[t + 1] - sigma[t]) * noise.astype(mx.float32)).astype(
                     latents.dtype
                 )
+                if blend_mask is not None:
+                    # the state now sits at sigma_{t+1}; pin unmasked tokens to the source there
+                    noised = blend_source + sigma[t + 1] * (noise_init - blend_source)
+                    latents = (blend_mask * latents + (1 - blend_mask) * noised).astype(latents.dtype)
                 mx.eval(latents)
                 ctx.in_loop(t, latents)
             except KeyboardInterrupt:  # noqa: PERF203
@@ -123,7 +187,22 @@ class QwenImage21Edit(nn.Module):
         del cache, negative_cache
         unpacked = QwenImage21LatentCreator.unpack_latents(latents, height, width).astype(mx.float32)
         decoded = VAEUtil.decode(self.vae, unpacked, self.tiling_config)
-        return ImageUtil.to_image(
+        if inpaint_mask is not None:
+            # float32 compositing keeps unmasked pixels exactly the source
+            keep = mx.array(np.asarray(inpaint_mask, dtype=np.float32) / 255.0)
+            original = np.asarray(blend_image).astype(np.float32).transpose(2, 0, 1) / 127.5 - 1
+            original = mx.array(original[: decoded.shape[1]]).reshape(decoded.shape)
+            decoded = keep * decoded.astype(mx.float32) + (1 - keep) * original
+        parameters = {"use_kv_cache": use_kv_cache, "output_resolution": output_resolution}
+        if strength < 1:
+            parameters["strength"] = strength
+        if auto_mask is not None:
+            parameters["auto_mask"] = auto_mask
+        if use_step_cache:
+            parameters["step_cache_threshold"] = step_cache_threshold
+        if enhance_prompt:
+            parameters["original_prompt"] = original_prompt
+        image = ImageUtil.to_image(
             decoded_latents=decoded,
             config=config,
             seed=seed,
@@ -132,8 +211,41 @@ class QwenImage21Edit(nn.Module):
             generation_time=config.time_steps.format_dict["elapsed"],
             image_paths=image_paths,
             negative_prompt=negative_prompt,
-            generation_parameters={"use_kv_cache": use_kv_cache, "output_resolution": output_resolution},
+            generation_parameters=parameters,
         )
+        if not verify:
+            return image
+        # Coarse self-check with the in-memory Qwen3-VL; a failed verdict retries with the
+        # next seed, each retry paying a full generation (hence opt-in).
+        verification = self._verify_output(original_prompt, source, image.image)
+        retries = 0
+        while not verification.get("verified") and retries < verify_retries:
+            retries += 1
+            logger.info("verify failed (%s); retry %d/%d", verification, retries, verify_retries)
+            retry_image = self.generate_image(
+                seed=seed + retries,
+                prompt=original_prompt,
+                num_inference_steps=num_inference_steps,
+                height=height,
+                width=width,
+                guidance=guidance,
+                negative_prompt=negative_prompt,
+                image_paths=image_paths,
+                output_resolution=output_resolution,
+                use_kv_cache=use_kv_cache,
+                mask_image=mask_image,
+                auto_mask=auto_mask,
+                strength=strength,
+                use_step_cache=use_step_cache,
+                step_cache_threshold=step_cache_threshold,
+                enhance_prompt=enhance_prompt,
+            )
+            retry_verification = self._verify_output(original_prompt, source, retry_image.image)
+            if retry_verification.get("verified"):
+                retry_image.verification = {**retry_verification, "retries": retries}
+                return retry_image
+        image.verification = {**verification, "retries": retries}
+        return image
 
     def save_model(self, base_path: str) -> None:
         ModelSaver.save_model(self, self.bits, base_path, QwenImage21WeightDefinition)
@@ -146,6 +258,83 @@ class QwenImage21Edit(nn.Module):
             if source.exists() and source.resolve() != (destination / relative).resolve():
                 (destination / relative).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination / relative)
+
+    def _resolve_mask(
+        self,
+        mask_image: str | Path | Image.Image | None,
+        auto_mask: str | None,
+        source: Image.Image | None,
+        width: int,
+        height: int,
+    ) -> Image.Image | None:
+        if mask_image is not None and auto_mask is not None:
+            logger.warning("both mask_image and auto_mask were given; using the explicit mask_image")
+        if mask_image is not None:
+            return open_oriented(mask_image).convert("L").resize((width, height), Image.Resampling.BILINEAR)
+        if auto_mask is None:
+            return None
+        if not auto_mask.strip():
+            raise ValueError("auto_mask must name an object to locate.")
+        reply = self._vision_reply(QwenImage21Grounding.GROUNDING_PROMPT.format(query=auto_mask), [source], 64)
+        # Qwen3-VL grounds in 0-1000 coordinates relative to the shown image
+        bbox = QwenImage21Grounding.parse_bbox(reply, source.size, normalized_1000=True)
+        if bbox is None:
+            raise ValueError(
+                f"auto_mask could not locate {auto_mask!r} in the first reference image "
+                f"(model reply: {reply[:120]!r}); provide mask_image instead."
+            )
+        logger.info("auto_mask %r resolved to bbox %s", auto_mask, tuple(round(v, 3) for v in bbox))
+        return QwenImage21Grounding.rasterize_mask(bbox, (width, height))
+
+    def _rewrite_prompt(self, prompt: str, source: Image.Image) -> str:
+        # Official serving recipe: rewrite a terse instruction into a detailed description
+        # before encoding. Best-effort: any failure falls back to the original instruction.
+        if not prompt or not prompt.strip():
+            return prompt
+        try:
+            reply = self._vision_reply(QwenImage21Grounding.REWRITE_PROMPT.format(instruction=prompt), [source], 256)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("enhance_prompt failed (%s); using the original", exc)
+            return prompt
+        rewritten = QwenImage21Grounding.parse_rewrite(reply)
+        if rewritten is None:
+            logger.warning("enhance_prompt could not parse the rewrite reply; using the original")
+            return prompt
+        return rewritten
+
+    def _verify_output(self, instruction: str, original: Image.Image, output: Image.Image) -> dict:
+        reply = self._vision_reply(
+            QwenImage21Grounding.VERIFY_PROMPT.format(instruction=instruction), [original, output], 64
+        )
+        verdict = QwenImage21Grounding.parse_verification(reply)
+        if verdict is None:
+            return {"verified": False, "parse_failed": True, "reply": reply[:120]}
+        applied, unchanged = verdict
+        return {"verified": applied and unchanged, "instruction_applied": applied, "outside_unchanged": unchanged}
+
+    def _vision_reply(self, instruction: str, images: list[Image.Image], max_new_tokens: int) -> str:
+        # Greedy chat reply from the in-memory Qwen3-VL over small copies of the images.
+        if self.text_encoder is None:
+            raise RuntimeError("The text encoder was released by the memory saver; reload the model.")
+        feeds = [QwenImage21Edit._vision_feed(image) for image in images]
+        text = QwenImage21Grounding.chat(instruction, len(feeds))
+        inputs = self.processor(text=[text], images=feeds, return_tensors="np")
+        ids = self.text_encoder.generate(
+            mx.array(inputs["input_ids"]),
+            pixel_values=mx.array(inputs["pixel_values"]),
+            image_grid_thw=mx.array(inputs["image_grid_thw"]),
+            max_new_tokens=max_new_tokens,
+        )
+        return self.processor.tokenizer.decode(ids)
+
+    @staticmethod
+    def _vision_feed(image: Image.Image, budget: int = 512) -> Image.Image:
+        # RGBA composites over white for the vision tower; ~512px keeps the prefill cheap.
+        rgba = image.convert("RGBA")
+        white = Image.new("RGB", rgba.size, "white")
+        white.paste(rgba, mask=rgba.getchannel("A"))
+        size = QwenImage21LatentCreator.dimensions(budget, image.width / image.height)
+        return white.resize(size, Image.Resampling.BICUBIC)
 
     def _encode_prompt(self, prompt: str, images: list[Image.Image]) -> tuple[mx.array, mx.array]:
         if not images and prompt in self.prompt_cache:

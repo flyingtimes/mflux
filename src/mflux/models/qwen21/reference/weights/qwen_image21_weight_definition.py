@@ -54,10 +54,14 @@ class QwenImage21WeightDefinition:
 
     @staticmethod
     def text_key(key: str) -> str | None:
-        key = key.removeprefix("model.")
-        if key == "language_model.norm.weight" or key.startswith("lm_head."):
-            return None
-        return key
+        # lm_head and the final norm serve only greedy decoding (auto-mask grounding,
+        # prompt rewriting, verification); the diffusion conditioning never reads them.
+        return key.removeprefix("model.")
+
+    @staticmethod
+    def is_generation_head(key: str) -> bool:
+        # Checkpoints saved before generation support omit these; loading tolerates that.
+        return key.startswith("lm_head.") or key.startswith("language_model.norm.")
 
     @staticmethod
     def text_weight(key: str, weight: mx.array) -> mx.array:

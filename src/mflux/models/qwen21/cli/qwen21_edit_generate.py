@@ -49,7 +49,78 @@ def build_parser() -> CommandLineParser:
         default=True,
         help="Reuse text and reference image prefix attention across steps (default: on).",
     )
+    parser.add_argument(
+        "--mask-image",
+        type=str,
+        default=None,
+        help="Inpaint mask (white = repaint, black = preserve) over the first reference image.",
+    )
+    parser.add_argument(
+        "--auto-mask",
+        type=str,
+        default=None,
+        help="Describe an object to repaint ('the red shirt'); the built-in Qwen3-VL locates it. "
+        "Ignored with --mask-image.",
+    )
+    parser.add_argument(
+        "--strength",
+        type=float,
+        default=1.0,
+        help="Edit strength in (0, 1]: 1.0 denoises from pure noise, lower values start from the "
+        "first reference partway down the schedule for subtler edits (default: 1.0).",
+    )
+    parser.add_argument(
+        "--use-step-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip unchanged transformer blocks on similar steps (faster, slightly different output; "
+        "needs --use-kv-cache).",
+    )
+    parser.add_argument(
+        "--step-cache-threshold",
+        type=float,
+        default=0.12,
+        help="Step-cache aggressiveness: higher skips more (default: 0.12).",
+    )
+    parser.add_argument(
+        "--enhance-prompt",
+        action="store_true",
+        help="Rewrite the instruction into a detailed prompt with the built-in Qwen3-VL first.",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="After generating, check the edit with the built-in Qwen3-VL.",
+    )
+    parser.add_argument(
+        "--verify-retries",
+        type=int,
+        default=0,
+        help="With --verify, regenerate with the next seed on a failed check, at most this many times.",
+    )
     return parser
+
+
+def validate_edit_args(parser: CommandLineParser, args, paths: list) -> None:
+    # Cheap checks that must fail before the model load.
+    edits = {
+        "--mask-image": args.mask_image is not None,
+        "--auto-mask": args.auto_mask is not None,
+        "--strength": args.strength != 1.0,
+        "--enhance-prompt": args.enhance_prompt,
+        "--verify": args.verify,
+    }
+    used = [flag for flag, on in edits.items() if on]
+    if used and not paths:
+        parser.error(f"{', '.join(used)} need at least one --image-paths reference image.")
+    if args.mask_image is not None and not Path(args.mask_image).exists():
+        parser.error(f"--mask-image not found: {args.mask_image}")
+    if args.auto_mask is not None and not args.auto_mask.strip():
+        parser.error("--auto-mask must name an object to locate.")
+    if not 0 < args.strength <= 1:
+        parser.error(f"--strength must be in (0, 1], got {args.strength}")
+    if args.verify_retries < 0:
+        parser.error(f"--verify-retries must be >= 0, got {args.verify_retries}")
 
 
 def main() -> None:
@@ -66,6 +137,7 @@ def main() -> None:
     paths = args.image_paths or []
     if len(paths) > 10:
         parser.error("Qwen-Image-2.1 supports at most 10 reference images.")
+    validate_edit_args(parser, args, paths)
     try:
         guidance = args.guidance if args.guidance is not None else 1.0
         if not math.isfinite(guidance) or guidance < 1:
@@ -105,7 +177,17 @@ def main() -> None:
                 image_paths=paths,
                 output_resolution=args.output_resolution,
                 use_kv_cache=args.use_kv_cache,
+                mask_image=args.mask_image,
+                auto_mask=args.auto_mask,
+                strength=args.strength,
+                use_step_cache=args.use_step_cache,
+                step_cache_threshold=args.step_cache_threshold,
+                enhance_prompt=args.enhance_prompt,
+                verify=args.verify,
+                verify_retries=args.verify_retries,
             )
+            if image.verification is not None:
+                print(f"verification: {image.verification}")
             image.save(Path(args.output.format(seed=seed)), export_json_metadata=args.metadata)
     except (StopImageGenerationException, PromptFileReadError) as exc:
         print(exc)

@@ -251,7 +251,11 @@ assert not hasattr(reference, "missing_attribute")
             QwenImage21WeightDefinition.text_key("model.language_model.layers.0.weight")
             == "language_model.layers.0.weight"
         )
-        assert QwenImage21WeightDefinition.text_key("lm_head.weight") is None
+        # kept for greedy decoding (auto-mask, prompt rewriting, verification)
+        assert QwenImage21WeightDefinition.text_key("lm_head.weight") == "lm_head.weight"
+        assert QwenImage21WeightDefinition.text_key("model.language_model.norm.weight") == "language_model.norm.weight"
+        assert QwenImage21WeightDefinition.is_generation_head("lm_head.scales")
+        assert not QwenImage21WeightDefinition.is_generation_head("language_model.layers.0.input_layernorm.weight")
         module = SimpleNamespace(to_quantized=lambda: None, weight=mx.zeros((64, 64)))
         assert QwenImage21WeightDefinition.quantization_predicate("transformer_blocks.0.attn.to_q", module)
         assert not QwenImage21WeightDefinition.quantization_predicate("modulation.1", module)

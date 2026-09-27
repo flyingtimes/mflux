@@ -59,14 +59,24 @@ class QwenImage21Initializer:
             )
             if weights.meta_data.quantization_level is not None:
                 QwenImage21Initializer._validate_weights(component.name, module, supplied)
-            mx.eval(module.parameters())
+            # Drop the loader's references first, then materialize a few tensors at a time:
+            # each dense source is freed once its quantized result exists, so the peak is the
+            # quantized component plus one chunk rather than dense and quantized side by side.
             del weights, supplied
+            parameters = [value for _, value in tree_flatten(module.parameters())]
+            for start in range(0, len(parameters), 8):
+                mx.eval(parameters[start : start + 8])
+            del parameters
             mx.clear_cache()
 
     @staticmethod
     def _validate_weights(name: str, module, supplied: dict[str, mx.array]) -> None:
         expected = dict(tree_flatten(module.parameters()))
         missing = {key for key in set(expected) - set(supplied) if not key.endswith(".inv_freq")}
+        if name == "text_encoder":
+            head = {key for key in missing if QwenImage21WeightDefinition.is_generation_head(key)}
+            module.has_generation_head = not head
+            missing -= head
         unexpected = set(supplied) - set(expected)
         mismatched = [key for key in expected.keys() & supplied.keys() if expected[key].shape != supplied[key].shape]
         if missing or unexpected or mismatched:

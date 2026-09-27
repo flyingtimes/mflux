@@ -10,6 +10,35 @@ from mflux.models.qwen21.reference.model.qwen_image21_transformer.blocks import 
 from mflux.models.qwen21.reference.model.qwen_image21_transformer.layout import QwenImage21Layout
 
 
+class StepCache:
+    """First-block step skipping (FBCache-style) for the prefix-cached target pass.
+
+    The blocks after the first reuse the previous step's hidden state while a relative-L1
+    signal on the first block's output, accumulated over steps, stays under the threshold.
+    norm_out and proj_out always re-run with the current timestep, so skipped steps still
+    track the schedule. Use one instance per guidance branch.
+    """
+
+    def __init__(self, threshold: float = 0.12) -> None:
+        self.threshold = threshold
+        self.hidden: mx.array | None = None
+        self._signal: mx.array | None = None
+        self._accumulated = 0.0
+
+    def should_skip(self, signal: mx.array) -> bool:
+        if self._signal is None:
+            return False
+        self._accumulated += float(mx.mean(mx.abs(signal - self._signal)) / (mx.mean(mx.abs(signal)) + 1e-6))
+        if self._accumulated < self.threshold:
+            return True
+        self._accumulated = 0.0
+        return False
+
+    def store(self, hidden: mx.array, signal: mx.array) -> None:
+        self.hidden = hidden
+        self._signal = signal
+
+
 class QwenImage21Transformer(nn.Module):
     def __init__(self, config: dict):
         super().__init__()
@@ -37,6 +66,7 @@ class QwenImage21Transformer(nn.Module):
         layout: QwenImage21Layout,
         cache: list | None = None,
         encoder_hidden_states_mask: mx.array | None = None,
+        step_cache: StepCache | None = None,
     ) -> mx.array:
         cached = cache is not None and len(cache) > 0
         target_mask = layout.target_mask
@@ -69,6 +99,7 @@ class QwenImage21Transformer(nn.Module):
         t = mx.concatenate([timestep.astype(x.dtype).reshape(-1), mx.zeros((1,), dtype=x.dtype)])
         time = self.time_text_embed(t, x.dtype)
         modulation = self.modulation[1](self.modulation[0](time))
+        signal = None
         for index, block in enumerate(self.transformer_blocks):
             x, stored = block(
                 x,
@@ -83,4 +114,13 @@ class QwenImage21Transformer(nn.Module):
             if stored is not None:
                 cache.append(stored)
             mx.eval(x)
+            if step_cache is not None and index == 0:
+                signal = x[:, -layout.target_tokens :]
+                # only a cached pass can skip: the extract pass must fill every layer's cache
+                if cached and step_cache.should_skip(signal):
+                    x = step_cache.hidden
+                    break
+        else:
+            if step_cache is not None:
+                step_cache.store(x[:, -layout.target_tokens :], signal)
         return self.proj_out(self.norm_out(x, time, target_mask))[:, -layout.target_tokens :]

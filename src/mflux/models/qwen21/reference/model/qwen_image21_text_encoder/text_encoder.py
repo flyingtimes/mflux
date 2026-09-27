@@ -39,6 +39,8 @@ class LanguageModel(nn.Module):
         self.rotary_emb = Qwen3VLRotaryEmbedding(
             dim=config["head_dim"], base=config["rope_theta"], mrope_section=params["mrope_section"]
         )
+        # Only greedy decoding (grounding, prompt rewriting, verification) reads the final norm.
+        self.norm = TextRMSNorm(config["hidden_size"], config["rms_norm_eps"])
 
     def __call__(
         self,
@@ -73,6 +75,9 @@ class QwenImage21TextEncoder(nn.Module):
             block.mlp.act_fn = self._tanh_gelu
         for merger in [self.visual.merger, *self.visual.deepstack_merger_list]:
             merger.act_fn = self._exact_gelu
+        text = config["text_config"]
+        self.lm_head = nn.Linear(text["hidden_size"], text["vocab_size"], bias=False)
+        self.has_generation_head = True  # the initializer clears it for checkpoints without lm_head
         self.image_token_id = config["image_token_id"]
         self.merge_size = config["vision_config"]["spatial_merge_size"]
 
@@ -91,6 +96,53 @@ class QwenImage21TextEncoder(nn.Module):
             hidden[:, image_indices] = features.astype(hidden.dtype)[None]
         positions = self.position_ids(input_ids, image_grid_thw)
         return self.language_model(hidden, positions, image_indices, deepstack)
+
+    def generate(
+        self,
+        input_ids: mx.array,
+        pixel_values: mx.array | None = None,
+        image_grid_thw: mx.array | None = None,
+        max_new_tokens: int = 64,
+        stop_token_ids: tuple[int, ...] = (151645, 151643),
+    ) -> list[int]:
+        # Greedy decoding with the Qwen3-VL the prompt encoder already holds (its lm_head
+        # is untied): one vision+prompt prefill into per-layer KV caches, then single-token
+        # steps. Deepstack injects during the prefill exactly as in __call__.
+        if not self.has_generation_head:
+            raise RuntimeError("This checkpoint has no text-encoder lm_head; re-save it from the official weights.")
+        model = self.language_model
+        hidden = model.embed_tokens(input_ids)
+        image_indices = mx.array(np.flatnonzero(np.asarray(input_ids[0]) == self.image_token_id), dtype=mx.int32)
+        deepstack = None
+        if pixel_values is not None:
+            features, deepstack = self.visual(pixel_values.astype(hidden.dtype), image_grid_thw, return_deepstack=True)
+            hidden[:, image_indices] = features.astype(hidden.dtype)[None]
+        positions = self.position_ids(input_ids, image_grid_thw)
+        rope = model.rotary_emb(hidden, positions)
+        idx = mx.arange(hidden.shape[1])
+        mask = (idx[:, None] >= idx[None, :])[None, None]
+        total = hidden.shape[1] + max_new_tokens
+        caches = []
+        for index, layer in enumerate(model.layers):
+            hidden, cache = layer(hidden, attention_mask=mask, position_embeddings=rope, max_cache_length=total)
+            if deepstack is not None and index < len(deepstack):
+                hidden[:, image_indices] += deepstack[index].astype(hidden.dtype)[None]
+            caches.append(cache)
+        mx.eval(hidden)
+        position = int(np.asarray(positions).max()) + 1
+        generated: list[int] = []
+        for _ in range(max_new_tokens):
+            next_id = int(mx.argmax(self.lm_head(model.norm(hidden[:, -1]))[0]).item())
+            if next_id in stop_token_ids:
+                break
+            generated.append(next_id)
+            hidden = model.embed_tokens(mx.array([[next_id]]))
+            rope = model.rotary_emb(hidden, mx.full((3, 1, 1), position, dtype=mx.int32))
+            for index, layer in enumerate(model.layers):
+                hidden, caches[index] = layer(hidden, position_embeddings=rope, past_key_value=caches[index])
+            mx.eval(hidden)
+            position += 1
+        return generated
 
     def position_ids(self, input_ids: mx.array, grids: mx.array | None) -> mx.array:
         ids = np.asarray(input_ids[0])

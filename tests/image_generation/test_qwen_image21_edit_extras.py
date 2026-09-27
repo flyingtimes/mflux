@@ -1,0 +1,369 @@
+import sys
+from types import SimpleNamespace
+
+import mlx.core as mx
+import numpy as np
+import pytest
+import torch
+from PIL import Image
+from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+
+from mflux.callbacks.callback_registry import CallbackRegistry
+from mflux.models.common.config import ModelConfig
+from mflux.models.qwen21.cli import qwen21_edit_generate as cli
+from mflux.models.qwen21.reference.model.qwen_image21_text_encoder.grounding import QwenImage21Grounding
+from mflux.models.qwen21.reference.model.qwen_image21_text_encoder.text_encoder import QwenImage21TextEncoder
+from mflux.models.qwen21.reference.model.qwen_image21_transformer.layout import QwenImage21Layout
+from mflux.models.qwen21.reference.model.qwen_image21_transformer.transformer import (
+    QwenImage21Transformer,
+    StepCache,
+)
+from mflux.models.qwen21.reference.weights.qwen_image21_weight_definition import QwenImage21WeightDefinition
+from mflux.models.qwen21.variants.edit.qwen_image_21_edit import QwenImage21Edit
+
+pytestmark = pytest.mark.fast
+
+SOURCE_RGB = (200, 30, 10)
+
+
+class _FakeTransformer:
+    axes = (4, 6, 6)
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, hidden, text, timestep, layout, cache=None, step_cache=None):
+        self.calls.append(float(timestep[0]))
+        return mx.ones((1, layout.target_tokens, hidden.shape[-1]))
+
+
+class _FakeVAE:
+    def encode(self, pixels):
+        h, w = pixels.shape[2] // 16, pixels.shape[3] // 16
+        return mx.full((1, 64, 1, h, w), float(mx.mean(pixels)))
+
+    def decode(self, latents):
+        # zeros: repainted pixels come back mid-gray, preserved ones must be the source
+        return mx.zeros((1, 4, 1, latents.shape[3] * 16, latents.shape[4] * 16))
+
+
+def _stub_model(prompts=None):
+    model = QwenImage21Edit.__new__(QwenImage21Edit)
+    model.model_config = ModelConfig.qwen_image_21()
+    model.processor = SimpleNamespace(image_processor=SimpleNamespace(size={"shortest_edge": 0, "longest_edge": 1e12}))
+    model.prompt_cache = {}
+    model.text_encoder = SimpleNamespace()
+    model.transformer = _FakeTransformer()
+    model.vae = _FakeVAE()
+    model.callbacks = CallbackRegistry()
+    model.tiling_config = None
+    model.bits = None
+
+    def encode(prompt, images):
+        if prompts is not None:
+            prompts.append(prompt)
+        # 64x64 reference at output_resolution 64 -> 4x4 latents -> 4 slots of 4 tokens
+        return mx.zeros((1, 6, 8)), mx.array([False, True, True, True, True, False])
+
+    model._encode_prompt = encode
+    return model
+
+
+def _source(tmp_path):
+    path = tmp_path / "source.png"
+    Image.new("RGBA", (64, 64), (*SOURCE_RGB, 255)).save(path)
+    return str(path)
+
+
+def _generate(model, tmp_path, **kwargs):
+    return model.generate_image(
+        seed=1,
+        prompt="edit",
+        num_inference_steps=4,
+        image_paths=[_source(tmp_path)],
+        output_resolution=64,
+        **kwargs,
+    )
+
+
+def _left_half_mask(tmp_path):
+    path = tmp_path / "mask.png"
+    mask = Image.new("L", (64, 64), 0)
+    mask.paste(255, (0, 0, 32, 64))
+    mask.save(path)
+    return str(path)
+
+
+def test_mask_image_repaints_only_the_white_region(tmp_path):
+    image = _generate(_stub_model(), tmp_path, mask_image=_left_half_mask(tmp_path))
+    pixels = np.asarray(image.image.convert("RGB")).astype(int)
+    np.testing.assert_allclose(pixels[32, 8], (128, 128, 128), atol=2)  # repainted (decoder zeros)
+    np.testing.assert_allclose(pixels[32, 56], SOURCE_RGB, atol=2)  # preserved exactly
+
+
+def test_auto_mask_reads_qwen3_vl_0_1000_boxes(tmp_path):
+    model = _stub_model()
+    model._vision_reply = lambda instruction, images, tokens: '[{"bbox_2d": [0, 0, 500, 1000], "label": "x"}]'
+    pixels = np.asarray(_generate(model, tmp_path, auto_mask="the left half").image.convert("RGB")).astype(int)
+    np.testing.assert_allclose(pixels[32, 8], (128, 128, 128), atol=2)
+    np.testing.assert_allclose(pixels[32, 56], SOURCE_RGB, atol=2)
+
+
+def test_auto_mask_without_a_box_is_an_actionable_error(tmp_path):
+    model = _stub_model()
+    model._vision_reply = lambda instruction, images, tokens: "I cannot see it"
+    with pytest.raises(ValueError, match="provide mask_image"):
+        _generate(model, tmp_path, auto_mask="a unicorn")
+
+
+@pytest.mark.parametrize("strength,calls", [(1.0, 4), (0.5, 2), (0.25, 1)])
+def test_strength_skips_the_start_of_the_schedule(tmp_path, strength, calls):
+    model = _stub_model()
+    _generate(model, tmp_path, strength=strength)
+    assert len(model.transformer.calls) == calls
+
+
+def test_enhance_prompt_encodes_the_rewrite_and_records_the_original(tmp_path):
+    prompts = []
+    model = _stub_model(prompts)
+    model._vision_reply = lambda instruction, images, tokens: '{"rewritten_prompt": "a detailed edit"}'
+    image = _generate(model, tmp_path, enhance_prompt=True)
+    assert prompts == ["a detailed edit"]
+    assert image.generation_parameters["original_prompt"] == "edit"
+
+
+def test_enhance_prompt_falls_back_on_an_unparseable_reply(tmp_path):
+    prompts = []
+    model = _stub_model(prompts)
+    model._vision_reply = lambda instruction, images, tokens: "no json here"
+    _generate(model, tmp_path, enhance_prompt=True)
+    assert prompts == ["edit"]
+
+
+def test_verify_retries_until_the_check_passes(tmp_path):
+    model = _stub_model()
+    replies = [
+        '{"instruction_applied": false, "outside_unchanged": true}',
+        '{"instruction_applied": true, "outside_unchanged": true}',
+    ]
+    model._vision_reply = lambda instruction, images, tokens: replies.pop(0)
+    image = _generate(model, tmp_path, verify=True, verify_retries=3)
+    assert image.verification == {
+        "verified": True,
+        "instruction_applied": True,
+        "outside_unchanged": True,
+        "retries": 1,
+    }
+    assert len(model.transformer.calls) == 8  # original + one retry
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"strength": 0.0}, "strength"),
+        ({"strength": 1.5}, "strength"),
+        ({"verify_retries": -1}, "verify_retries"),
+    ],
+)
+def test_invalid_edit_arguments_are_rejected(tmp_path, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _generate(_stub_model(), tmp_path, **kwargs)
+
+
+def test_edit_features_need_a_reference_image():
+    with pytest.raises(ValueError, match="need a reference image"):
+        _stub_model().generate_image(seed=1, prompt="p", num_inference_steps=4, auto_mask="x")
+
+
+def test_vision_reply_expands_one_placeholder_per_image():
+    model = _stub_model()
+    seen = {}
+
+    def processor(text, images, return_tensors):
+        seen["text"], seen["sizes"] = text[0], [image.size for image in images]
+        return {
+            "input_ids": np.zeros((1, 3), np.int32),
+            "pixel_values": np.zeros((4, 8)),
+            "image_grid_thw": [[1, 2, 2]],
+        }
+
+    tokenizer = SimpleNamespace(decode=lambda ids: f"ids={ids}")
+    model.processor = type("Processor", (), {"__call__": staticmethod(processor), "tokenizer": tokenizer})()
+    model.text_encoder = SimpleNamespace(generate=lambda *a, **k: [5, 6])
+    reply = model._vision_reply("compare", [Image.new("RGBA", (1024, 512)), Image.new("RGB", (64, 64))], 8)
+    assert reply == "ids=[5, 6]"
+    assert seen["text"].count("<|vision_start|><|image_pad|><|vision_end|>") == 2
+    assert seen["text"].endswith("compare<|im_end|>\n<|im_start|>assistant\n")
+    assert seen["sizes"][0] == (736, 352)  # ~512px budget, aspect kept
+
+
+def test_step_cache_reuses_the_extract_step_on_an_unchanged_signal():
+    mx.random.seed(0)
+    model = QwenImage21Transformer(
+        dict(
+            num_layers=3,
+            num_attention_heads=2,
+            attention_head_dim=16,
+            axes_dims_rope=(4, 6, 6),
+            context_in_dim=32,
+            in_channels=4,
+            out_channels=4,
+            mlp_ratio=3,
+            eps=1e-6,
+            causal_condition=True,
+        )
+    )
+    layout = QwenImage21Layout.create(mx.array([False, True, True, False]), [(1, 2, 2)] * 3, (4, 6, 6))
+    hidden, text = mx.random.normal((1, 12, 4)), mx.random.normal((1, 4, 32))
+    cache, step_cache = [], StepCache(0.12)
+    first = model(hidden, text, mx.array([0.5]), layout, cache, step_cache=step_cache)
+    assert step_cache.hidden.shape[1] == layout.target_tokens
+    stored = step_cache.hidden
+    second = model(hidden, text, mx.array([0.5]), layout, cache, step_cache=step_cache)
+    assert step_cache.hidden is stored  # skipped: blocks 1..N did not run
+    np.testing.assert_allclose(np.array(second), np.array(first), rtol=1e-4, atol=1e-4)
+
+
+def test_step_cache_recomputes_once_the_signal_accumulates():
+    cache = StepCache(0.1)
+    cache.store(mx.zeros((1, 2, 2)), mx.ones((1, 2, 2)))
+    assert cache.should_skip(mx.ones((1, 2, 2)) * 1.05)
+    assert not cache.should_skip(mx.ones((1, 2, 2)) * 1.2)
+
+
+def test_generation_head_is_optional_when_loading():
+    from mflux.models.qwen21.reference.qwen_image21_initializer import QwenImage21Initializer
+
+    module = SimpleNamespace(
+        parameters=lambda: {"lm_head": {"weight": mx.zeros((2, 2))}, "embed": {"weight": mx.zeros((2, 2))}}
+    )
+    QwenImage21Initializer._validate_weights("text_encoder", module, {"embed.weight": mx.zeros((2, 2))})
+    assert module.has_generation_head is False
+    with pytest.raises(ValueError, match="missing"):
+        QwenImage21Initializer._validate_weights("vae", module, {"embed.weight": mx.zeros((2, 2))})
+
+
+def test_grounding_parse_bbox_regimes():
+    parse = QwenImage21Grounding.parse_bbox
+    assert parse('[{"bbox_2d": [10, 20, 110, 80]}]', (200, 100)) == (0.05, 0.2, 0.55, 0.8)
+    assert parse("[[0.1, 0.2, 0.6, 0.8]]", (200, 100)) == (0.1, 0.2, 0.6, 0.8)
+    assert parse("[[359, 168, 580, 783]]", (512, 512)) == (0.359, 0.168, 0.58, 0.783)
+    assert parse("[[100, 200, 400, 500]]", (512, 512), normalized_1000=True) == (0.1, 0.2, 0.4, 0.5)
+    assert parse("I cannot see it", (200, 100)) is None
+    assert parse("[[50, 50, 50, 90]]", (200, 100)) is None
+    assert parse("[[10, 20, 1100, 1700]]", (512, 512), normalized_1000=True) is None
+
+
+def test_grounding_parse_rewrite_and_verification():
+    assert QwenImage21Grounding.parse_rewrite('noise {"rewritten_prompt": " x y "}') == "x y"
+    assert QwenImage21Grounding.parse_rewrite('{"rewrited_prompt": "x y"}') == "x y"
+    assert QwenImage21Grounding.parse_rewrite("nothing") is None
+    verdict = '{"instruction_applied": true, "outside_unchanged": false}'
+    assert QwenImage21Grounding.parse_verification(verdict) == (True, False)
+    assert QwenImage21Grounding.parse_verification("no verdict") is None
+
+
+def test_grounding_masks():
+    mask = QwenImage21Grounding.rasterize_mask((0.25, 0.25, 0.75, 0.75), (64, 64))
+    assert mask.getpixel((32, 32)) == 255 and mask.getpixel((2, 2)) == 0
+    grid = QwenImage21Grounding.to_latent_mask(mask, 4, 4)
+    assert grid.shape == (4, 4) and grid[1, 1] > 0.9 and grid[0, 0] < 0.1
+
+
+@pytest.mark.parametrize(
+    "argv,match",
+    [
+        (["--auto-mask", "shirt"], "need at least one --image-paths"),
+        (["--strength", "0"], "strength"),
+        (["--verify-retries", "-1"], "verify-retries"),
+    ],
+)
+def test_invalid_edit_flags_fail_before_loading(monkeypatch, capsys, argv, match):
+    monkeypatch.setattr(sys, "argv", ["qwen21", "--prompt", "p", *argv])
+    monkeypatch.setattr(cli, "QwenImage21Edit", lambda **kwargs: pytest.fail("Invalid input reached model loading"))
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert match in capsys.readouterr().err
+
+
+def test_missing_mask_image_fails_before_loading(monkeypatch, tmp_path, capsys):
+    source = _source(tmp_path)
+    argv = ["qwen21", "--prompt", "p", "--image-paths", source, "--mask-image", str(tmp_path / "nope.png")]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(cli, "QwenImage21Edit", lambda **kwargs: pytest.fail("Invalid input reached model loading"))
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert "--mask-image not found" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "ids,grids",
+    [
+        ([1, 2, 3, 4, 5], None),
+        ([1, 98, 99, 99, 99, 99, 97, 5], [[1, 4, 4]]),
+    ],
+)
+def test_generate_matches_torch_greedy_decoding(ids, grids):
+    config = dict(
+        image_token_id=99,
+        vision_start_token_id=98,
+        vision_end_token_id=97,
+        text_config=dict(
+            vocab_size=128,
+            hidden_size=32,
+            num_hidden_layers=3,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            intermediate_size=64,
+            head_dim=16,
+            max_position_embeddings=2048,
+            rope_theta=5000000.0,
+            rms_norm_eps=1e-6,
+            attention_bias=False,
+            rope_scaling=dict(rope_type="default", mrope_section=[4, 2, 2], mrope_interleaved=True),
+        ),
+        vision_config=dict(
+            depth=3,
+            hidden_size=32,
+            intermediate_size=64,
+            num_heads=2,
+            patch_size=2,
+            temporal_patch_size=2,
+            in_channels=3,
+            spatial_merge_size=2,
+            out_hidden_size=32,
+            num_position_embeddings=16,
+            deepstack_visual_indexes=[0, 1, 2],
+            hidden_act="gelu_pytorch_tanh",
+        ),
+    )
+    torch.manual_seed(7)
+    reference = Qwen3VLForConditionalGeneration(Qwen3VLConfig(**config)).to(device="cpu", dtype=torch.float32).eval()
+    with torch.no_grad():
+        reference.lm_head.weight.mul_(20)  # sharpen logits so greedy ties cannot flip on rounding
+    model = QwenImage21TextEncoder(config)
+    weights = []
+    for key, value in reference.state_dict().items():
+        mapped = QwenImage21WeightDefinition.text_key(key)
+        weights.append((mapped, QwenImage21WeightDefinition.text_weight(mapped, mx.array(value.numpy()))))
+    model.load_weights(weights, strict=False)  # rotary inv_freq buffers are computed, not loaded
+    input_ids = torch.tensor([ids])
+    kwargs, mlx_kwargs = {}, {}
+    if grids is not None:
+        grid = torch.tensor(grids)
+        pixels = torch.randn(int(grid.prod(-1).sum()), 24)
+        kwargs = dict(pixel_values=pixels, image_grid_thw=grid, mm_token_type_ids=(input_ids == 99).int())
+        mlx_kwargs = dict(pixel_values=mx.array(pixels.numpy()), image_grid_thw=mx.array(grids))
+    with torch.no_grad():
+        expected = reference.generate(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            max_new_tokens=6,
+            do_sample=False,
+            eos_token_id=None,
+            pad_token_id=0,
+            **kwargs,
+        )[0, len(ids) :].tolist()
+    actual = model.generate(mx.array([ids]), max_new_tokens=6, stop_token_ids=(), **mlx_kwargs)
+    assert actual == expected

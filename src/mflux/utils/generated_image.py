@@ -79,6 +79,8 @@ class GeneratedImage:
         self.init_metadata = init_metadata
         self.pid_decode = pid_decode
         self.pid_degrade_sigma = pid_degrade_sigma
+        # Optional post-edit self-check result (Qwen-Image-2.1 edit verify), kept out of the metadata.
+        self.verification: dict | None = None
         self.generation_parameters = generation_parameters or {}
 
     def get_right_half(self) -> "GeneratedImage":
