@@ -128,6 +128,13 @@ def test_rgba_output_keeps_alpha_and_pil_mode(tmp_path) -> None:
 
 
 @pytest.mark.fast
+def test_empty_condition_images_rejected(tmp_path) -> None:
+    model = _stub_model(tmp_path)
+    with pytest.raises(ValueError, match="at least one condition image"):
+        model.generate_image(seed=1, prompt="p", image_paths=[], num_inference_steps=1)
+
+
+@pytest.mark.fast
 def test_more_than_ten_condition_images_rejected(tmp_path) -> None:
     ref = tmp_path / "ref.png"
     PILImage.new("RGB", (64, 64)).save(ref)

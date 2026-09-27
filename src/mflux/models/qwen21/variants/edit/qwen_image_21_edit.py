@@ -74,6 +74,8 @@ class QwenImage21Edit(nn.Module):
         verify_retries: int = 0,
         rgba_output: bool = False,
     ) -> GeneratedImage:
+        if not image_paths:
+            raise ValueError("Qwen-Image-2.1 editing needs at least one condition image, got none")
         # Normalize inputs to PIL up front (same normalization order as the reference).
         # open_oriented applies the file's EXIF Orientation tag so a portrait JPEG stored
         # landscape is encoded the way it displays; RGBA mode is preserved for the VAE.
