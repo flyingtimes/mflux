@@ -75,3 +75,19 @@ def test_rejects_non_six_step_counts():
     )
     with pytest.raises(ValueError, match="6 trained sigma nodes"):
         ViggleTurboScheduler(config)
+
+
+@pytest.mark.fast
+@pytest.mark.parametrize("module", ["qwen21_generate", "qwen21_edit_generate"])
+def test_cli_rejects_wrong_turbo_step_count_before_loading(module, monkeypatch):
+    import importlib
+    import sys
+
+    cli = importlib.import_module(f"mflux.models.qwen21.cli.{module}")
+    model_class = "QwenImage21Edit" if module == "qwen21_edit_generate" else "QwenImage21"
+    monkeypatch.setattr(cli, model_class, lambda **kwargs: pytest.fail("Invalid input reached model loading"))
+    argv = ["qwen21", "--prompt", "test", "--scheduler", "viggle_turbo", "--steps", "8", "--output", "out.png"]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2

@@ -9,38 +9,26 @@ from mflux.utils.exceptions import PromptFileReadError, StopImageGenerationExcep
 from mflux.utils.prompt_util import PromptUtil
 
 DEFAULT_MODEL = "qwen-image-2.1"
+IGNORED_OPTIONS = {"--lora-style": "Named LoRA styles are only supported by the Flux in-context CLI; use --lora."}
 
 
 def build_parser() -> CommandLineParser:
     parser = CommandLineParser(description="Generate an image using Qwen Image 2.1 model.")
     parser.add_general_arguments()
     parser.add_model_arguments(require_model_arg=False, default_model=DEFAULT_MODEL)
+    parser.add_lora_arguments()
     parser.add_image_generator_arguments(supports_metadata_config=True, supports_dimension_scale_factor=True)
     parser.add_image_to_image_arguments(required=False)
-    parser.add_lora_arguments()
     parser.add_output_arguments()
+    parser.add_step_cache_arguments()
     return parser
-
-
-def validate_args(parser: CommandLineParser, args) -> None:
-    """Cheap checks that must fail BEFORE the ~33 GB model load."""
-    if args.scheduler == "viggle_turbo":
-        if args.steps != len(ViggleTurboScheduler.SIGMA_NODES):
-            parser.error(
-                f"--scheduler viggle_turbo samples the distilled LoRA on its fixed sigma nodes; "
-                f"use --steps {len(ViggleTurboScheduler.SIGMA_NODES)}, got {args.steps}"
-            )
-        if not args.lora_paths:
-            print(
-                "⚠️  --scheduler viggle_turbo without --lora runs the BASE model on 6 nodes; "
-                "pass the distilled adapter for turbo results."
-            )
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
-    validate_args(parser, args)
+    CommandLineParser.warn_ignored_options(IGNORED_OPTIONS)
+    ViggleTurboScheduler.check_args(parser, args)
 
     model_config = ConfigResolution.resolve_restricted(
         args.model,
@@ -81,6 +69,7 @@ def main():
                 image_path=args.image_path,
                 num_inference_steps=args.steps,
                 image_strength=args.image_strength,
+                step_cache_ratio=args.step_cache_ratio,
             )
             image.save(path=args.output.format(seed=seed), export_json_metadata=args.metadata)
     except (StopImageGenerationException, PromptFileReadError) as exc:

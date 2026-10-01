@@ -13,6 +13,7 @@ from mflux.models.common.resolution.config_resolution import ConfigResolution
 from mflux.models.common.resolution.lora_resolution import LoraResolution
 from mflux.models.flux.variants.in_context.utils.in_context_loras import LORA_NAME_MAP
 from mflux.utils import box_values, scale_factor
+from mflux.utils.logging_util import LoggingUtil
 
 
 def finite_float(value: str) -> float:
@@ -64,6 +65,16 @@ def positive_float(value: str) -> float:
     return parsed
 
 
+def open_unit_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"'{value}' is not a valid number")
+    if not 0 < parsed < 1:
+        raise argparse.ArgumentTypeError(f"'{value}' must be > 0 and < 1")
+    return parsed
+
+
 def vae_tile_size(value: str) -> int:
     # The decode tiler uses a fixed 64px overlap; the tile must be strictly larger
     # than the overlap or the tiling stride becomes <= 0. 128 is the practical floor.
@@ -100,6 +111,7 @@ class CommandLineParser(argparse.ArgumentParser):
         self.require_image_paths = False
         self.require_redux_image_paths = False
         self.default_model = None
+        self.add_argument("--verbose", "-v", action="store_true", default=False, help="Enable verbose (debug-level) logging.")
 
     def add_general_arguments(self) -> None:
         self.add_argument("--battery-percentage-stop-limit", "-B", type=lambda v: max(min(int(v), 99), 1), default=ui_defaults.BATTERY_PERCENTAGE_STOP_LIMIT, help=f"On Macs powered by battery, stop image generation when battery reaches this percentage. Default: {ui_defaults.BATTERY_PERCENTAGE_STOP_LIMIT}")
@@ -241,6 +253,10 @@ class CommandLineParser(argparse.ArgumentParser):
         self.require_redux_image_paths = True
         self.add_argument("--redux-image-paths", type=Path, nargs="*", default=None, help="Local path to the source image")
         self.add_argument("--redux-image-strengths", type=float, nargs="*", default=None, help="Strength values (between 0.0 and 1.0) for each reference image. Default is 1.0 for all images.")
+
+    def add_step_cache_arguments(self) -> None:
+        # --teacache-ratio is the flag's first released name (Qwen Image 2.1); it stays as an alias.
+        self.add_argument("--step-cache-ratio", "--teacache-ratio", dest="step_cache_ratio", type=open_unit_float, default=None, help="TeaCache-style step reuse: skip the transformer on this fraction of denoise steps (those whose timestep signal changes least; the first and last 10%% always run) and reuse the previous step's prediction. Must be within (0, 1). Trades a little detail for speed: 0.25 is about 1.4x faster. Runs under 10 steps are unaffected. Default: off.")
 
     def add_pid_decode_arguments(self) -> None:
         self.add_argument("--pid-decode", action=argparse.BooleanOptionalAction, default=False, help="Decode with NVIDIA PiD's pixel-diffusion super-resolving decoder instead of the standard VAE. First run downloads two separate Hugging Face checkpoints (~8GB total); google/gemma-2-2b-it is gated and requires accepting its license + `hf auth login`.")
@@ -393,6 +409,7 @@ class CommandLineParser(argparse.ArgumentParser):
 
     def parse_args(self) -> argparse.Namespace:  # type: ignore
         namespace = super().parse_args()
+        LoggingUtil.configure_logging(verbose=getattr(namespace, "verbose", False))
 
         if getattr(namespace, "no_metadata", False):
             from mflux.utils.image_util import ImageUtil
@@ -460,6 +477,25 @@ class CommandLineParser(argparse.ArgumentParser):
                 namespace.height = prior_gen_metadata.get("height") or namespace.height
             if hasattr(namespace, "width") and not self._option_was_provided("--width"):
                 namespace.width = prior_gen_metadata.get("width") or namespace.width
+            for parameter in ("use_kv_cache", "output_resolution"):
+                option = parameter.replace("_", "-")
+                if (
+                    hasattr(namespace, parameter)
+                    and parameter in prior_gen_metadata
+                    and not self._option_was_provided(f"--{option}", f"--no-{option}")
+                ):
+                    setattr(namespace, parameter, prior_gen_metadata[parameter])
+            # Step reuse changes the image, so a sidecar that recorded it replays it.
+            if (
+                hasattr(namespace, "step_cache_ratio")
+                and prior_gen_metadata.get("step_cache_ratio") is not None
+                and not self._option_was_provided("--step-cache-ratio", "--teacache-ratio")
+            ):
+                # Same range check as the flag, so a bad sidecar fails here instead of after the model loads.
+                try:
+                    namespace.step_cache_ratio = open_unit_float(str(prior_gen_metadata["step_cache_ratio"]))
+                except argparse.ArgumentTypeError as exc:
+                    self.error(f"step_cache_ratio in --config-from-metadata: {exc}")
 
             # all configs from the metadata config defers to any explicitly defined args
             guidance_default = self.get_default("guidance")

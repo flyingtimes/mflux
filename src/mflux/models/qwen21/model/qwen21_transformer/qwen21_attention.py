@@ -1,8 +1,17 @@
+# Copyright 2026 The Qwen Team and The HuggingFace Team.
+# SPDX-License-Identifier: Apache-2.0
+# Reference attention adapted from Qwen/Hugging Face's QwenImage21Transformer2DModel.
 from __future__ import annotations
 
 import mlx.core as mx
 from mlx import nn
 from mlx.core.fast import scaled_dot_product_attention
+
+from mflux.models.qwen21.model.qwen21_transformer.qwen21_fused_kernels import (
+    fused_qk_norm_rope,
+    fused_qk_norm_rope_available,
+)
+from mflux.models.qwen21.model.qwen21_transformer.qwen21_layout import QwenImage21Layout
 
 
 class Qwen21Attention(nn.Module):
@@ -16,6 +25,8 @@ class Qwen21Attention(nn.Module):
         self.to_out = [nn.Linear(num_heads * head_dim, dim, bias=False)]
         self.norm_q = nn.RMSNorm(head_dim, eps=eps)
         self.norm_k = nn.RMSNorm(head_dim, eps=eps)
+        # the fused kernel hard-codes eps = 1e-6. Other eps values use the composed path.
+        self.use_fused_prologue = fused_qk_norm_rope_available(head_dim) and eps == 1e-6
 
     def __call__(
         self,
@@ -24,71 +35,8 @@ class Qwen21Attention(nn.Module):
         rope_sin: mx.array,
         attn_mask: mx.array | None,
         text_len: int | None = None,
-        kv_pair: tuple[mx.array, mx.array] | None = None,
-        kv_mode: str | None = None,
-        prefix_len: int = 0,
-        segments: list[tuple[int, int, bool, mx.array | None]] | None = None,
-    ) -> mx.array | tuple[mx.array, tuple[mx.array, mx.array]]:
-        query = mx.reshape(self.to_q(hidden_states), (*hidden_states.shape[:-1], self.num_heads, self.head_dim))
-        key = mx.reshape(self.to_k(hidden_states), (*hidden_states.shape[:-1], self.num_heads, self.head_dim))
-        value = mx.reshape(self.to_v(hidden_states), (*hidden_states.shape[:-1], self.num_heads, self.head_dim))
-
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
-        query = Qwen21Attention._apply_rope(query, rope_cos, rope_sin)
-        key = Qwen21Attention._apply_rope(key, rope_cos, rope_sin)
-
-        query = mx.transpose(query, (0, 2, 1, 3))
-        key = mx.transpose(key, (0, 2, 1, 3))
-        value = mx.transpose(value, (0, 2, 1, 3))
-
-        if segments is not None:
-            # exact multi-pass prefill, one call per run: a text run attends its whole
-            # prefix causally (small additive mask), an image run attends its whole
-            # prefix unmasked. Avoids any quadratic dense mask tensor.
-            out_parts = []
-            for start, end, is_text, seg_mask in segments:
-                out_parts.append(
-                    scaled_dot_product_attention(
-                        query[:, :, start:end],
-                        key[:, :, :end],
-                        value[:, :, :end],
-                        scale=self.head_dim**-0.5,
-                        mask=seg_mask,
-                    )
-                )
-            attn_out = self._merge(mx.concatenate(out_parts, axis=2))
-            if kv_mode == "extract":
-                prefix_kv = (key[:, :, :prefix_len], value[:, :, :prefix_len])
-                return attn_out, prefix_kv
-            return attn_out
-
-        if kv_mode == "extract":
-            # dense-mask fallback; store the prefix (text + reference) K/V --
-            # causal_condition keeps them step-independent
-            attn_out = scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                scale=self.head_dim**-0.5,
-                mask=attn_mask,
-            )
-            prefix_kv = (key[:, :, :prefix_len], value[:, :, :prefix_len])
-            return self._merge(attn_out), prefix_kv
-
-        if kv_mode == "cached":
-            # later steps: only target queries are recomputed; they attend the frozen
-            # prefix K/V from the cache plus their own tokens -- full attention, no mask
-            key = mx.concatenate([kv_pair[0], key], axis=2)
-            value = mx.concatenate([kv_pair[1], value], axis=2)
-            attn_out = scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                scale=self.head_dim**-0.5,
-            )
-            return self._merge(attn_out), kv_pair
+    ) -> mx.array:
+        query, key, value = self._project(hidden_states, rope_cos, rope_sin)
 
         if text_len is not None and attn_mask is None:
             # block-causal, segmented like the reference processor: causal text attention
@@ -106,21 +54,135 @@ class Qwen21Attention(nn.Module):
                 value,
                 scale=self.head_dim**-0.5,
             )
-            hidden_states = mx.concatenate([text_out, target_out], axis=2)
-        else:
-            hidden_states = scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                scale=self.head_dim**-0.5,
-                mask=attn_mask,
-            )
-        return self._merge(hidden_states)
+            return self._unproject(mx.concatenate([text_out, target_out], axis=2))
+        hidden_states = scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            scale=self.head_dim**-0.5,
+            mask=attn_mask,
+        )
+        return self._unproject(hidden_states)
 
-    def _merge(self, attn_out: mx.array) -> mx.array:
-        hidden_states = mx.transpose(attn_out, (0, 2, 1, 3))
+    def forward_reference(
+        self,
+        x: mx.array,
+        layout: QwenImage21Layout,
+        rope: tuple[mx.array, mx.array],
+        cached: tuple[mx.array, mx.array] | None = None,
+        extract: bool = False,
+        key_valid: mx.array | None = None,
+    ) -> tuple[mx.array, tuple[mx.array, mx.array] | None]:
+        batch, length, dim = x.shape
+        q, k, v = [
+            layer(x).reshape(batch, length, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+            for layer in (self.to_q, self.to_k, self.to_v)
+        ]
+        q = QwenImage21Layout.rotate(self.norm_q(q).astype(v.dtype), rope)
+        k = QwenImage21Layout.rotate(self.norm_k(k).astype(v.dtype), rope)
+        stored = None
+        if cached is not None:
+            k, v = mx.concatenate([cached[0], k], axis=2), mx.concatenate([cached[1], v], axis=2)
+        elif extract:
+            stored = (mx.contiguous(k[:, :, : layout.prefix_length]), mx.contiguous(v[:, :, : layout.prefix_length]))
+        scale = self.head_dim**-0.5
+        if cached is not None:
+            mask = key_valid[:, None, None, :] if key_valid is not None else None
+            output = scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+        else:
+            outputs = []
+            for start, end, is_text in [*layout.segments, (layout.prefix_length, length, False)]:
+                mask = None
+                if is_text:
+                    mask = mx.arange(end)[None, :] <= mx.arange(start, end)[:, None]
+                if key_valid is not None:
+                    valid = key_valid[:, None, None, :end]
+                    mask = valid if mask is None else mask[None, None] & valid
+                outputs.append(
+                    scaled_dot_product_attention(
+                        q[:, :, start:end], k[:, :, :end], v[:, :, :end], scale=scale, mask=mask
+                    )
+                )
+            output = mx.concatenate(outputs, axis=2)
+        return self.to_out[0](output.transpose(0, 2, 1, 3).reshape(batch, length, dim)), stored
+
+    def _project(
+        self,
+        hidden_states: mx.array,
+        rope_cos: mx.array,
+        rope_sin: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """Shared Q/K/V projection: returns [batch, heads, seq, head_dim]."""
+        if self.use_fused_prologue:
+            fused = fused_qk_norm_rope(
+                self.to_q(hidden_states),
+                self.to_k(hidden_states),
+                self.norm_q.weight,
+                self.norm_k.weight,
+                rope_cos,
+                rope_sin,
+                self.num_heads,
+                self.head_dim,
+            )
+            if fused is not None:
+                out_q, out_k = fused
+                batch, length = out_q.shape[:2]
+                query = mx.transpose(out_q.reshape(batch, length, self.num_heads, self.head_dim), (0, 2, 1, 3))
+                key = mx.transpose(out_k.reshape(batch, length, self.num_heads, self.head_dim), (0, 2, 1, 3))
+                value = mx.transpose(
+                    mx.reshape(self.to_v(hidden_states), (*hidden_states.shape[:-1], self.num_heads, self.head_dim)),
+                    (0, 2, 1, 3),
+                )
+                return query, key, value
+
+        query = mx.reshape(self.to_q(hidden_states), (*hidden_states.shape[:-1], self.num_heads, self.head_dim))
+        key = mx.reshape(self.to_k(hidden_states), (*hidden_states.shape[:-1], self.num_heads, self.head_dim))
+        value = mx.reshape(self.to_v(hidden_states), (*hidden_states.shape[:-1], self.num_heads, self.head_dim))
+
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+
+        query = Qwen21Attention._apply_rope(query, rope_cos, rope_sin)
+        key = Qwen21Attention._apply_rope(key, rope_cos, rope_sin)
+
+        return mx.transpose(query, (0, 2, 1, 3)), mx.transpose(key, (0, 2, 1, 3)), mx.transpose(value, (0, 2, 1, 3))
+
+    def _unproject(self, hidden_states: mx.array) -> mx.array:
+        hidden_states = mx.transpose(hidden_states, (0, 2, 1, 3))
         hidden_states = mx.reshape(hidden_states, (*hidden_states.shape[:-2], self.num_heads * self.head_dim))
         return self.to_out[0](hidden_states)
+
+    def text_attention(
+        self,
+        hidden_states: mx.array,
+        rope_cos: mx.array,
+        rope_sin: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """Causal text-prefix attention; also returns the prefix K/V to cache.
+
+        Text tokens read the timestep-independent t=0 modulation row and only
+        attend (causally) to each other, so their post-rope K/V are identical on
+        every denoise step (and independent of the image stream) — compute them
+        once per prompt and reuse them for the image-only steps.
+        """
+        query, key, value = self._project(hidden_states, rope_cos, rope_sin)
+        hidden_states = scaled_dot_product_attention(query, key, value, scale=self.head_dim**-0.5, mask="causal")
+        return self._unproject(hidden_states), mx.contiguous(key), mx.contiguous(value)
+
+    def image_attention(
+        self,
+        hidden_states: mx.array,
+        key_text: mx.array,
+        value_text: mx.array,
+        rope_cos: mx.array,
+        rope_sin: mx.array,
+    ) -> mx.array:
+        """Image-block attention over the full [cached text | image] sequence."""
+        query, key, value = self._project(hidden_states, rope_cos, rope_sin)
+        key = mx.concatenate([key_text, key], axis=2)
+        value = mx.concatenate([value_text, value], axis=2)
+        hidden_states = scaled_dot_product_attention(query, key, value, scale=self.head_dim**-0.5)
+        return self._unproject(hidden_states)
 
     @staticmethod
     def _apply_rope(x: mx.array, cos_vals: mx.array, sin_vals: mx.array) -> mx.array:

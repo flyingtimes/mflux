@@ -1,192 +1,118 @@
 import argparse
+import math
 from pathlib import Path
 
 from mflux.callbacks.callback_manager import CallbackManager
 from mflux.cli.parser.parsers import CommandLineParser, lora_init_kwargs_from_args
 from mflux.models.common.resolution.config_resolution import ConfigResolution
-from mflux.models.qwen21.latent_creator.qwen21_latent_creator import Qwen21LatentCreator
 from mflux.models.qwen21.model.qwen21_scheduler import ViggleTurboScheduler
-from mflux.models.qwen21.variants.edit.qwen_image_21_edit import QwenImage21Edit
+from mflux.models.qwen21.reference import QwenImage21Edit
+from mflux.models.qwen21.reference.latent_creator.qwen_image21_latent_creator import QwenImage21LatentCreator
 from mflux.utils.dimension_resolver import DimensionResolver
-from mflux.utils.exceptions import PromptFileReadError, StopImageGenerationException
+from mflux.utils.exceptions import ModelConfigError, PromptFileReadError, StopImageGenerationException
 from mflux.utils.prompt_util import PromptUtil
+from mflux.utils.scale_factor import ScaleFactor
 
-DEFAULT_MODEL = "qwen-image-2.1"
-
-TURBO_SIGMA_NODES = len(ViggleTurboScheduler.SIGMA_NODES)
+IGNORED_OPTIONS = {"--lora-style": "Named LoRA styles are only supported by the Flux in-context CLI; use --lora."}
+CONDITIONAL_OPTIONS = {
+    "--scheduler": {
+        "condition": "linear Euler or viggle_turbo scheduler only",
+        "reason": "Other scheduler values exit with an error before model loading.",
+    },
+    "--negative-prompt": {
+        "condition": "guidance greater than 1",
+        "reason": "Guidance 1 runs only the positive branch.",
+    },
+}
 
 
 def build_parser() -> CommandLineParser:
-    parser = CommandLineParser(description="Edit images using Qwen Image 2.1 with natural-language instructions.")
+    parser = CommandLineParser(description="Generate and edit RGB/RGBA images with Qwen-Image-2.1.")
     parser.add_general_arguments()
-    parser.add_model_arguments(require_model_arg=False, default_model=DEFAULT_MODEL)
-    parser.add_image_generator_arguments(supports_metadata_config=True, supports_dimension_scale_factor=True)
-    parser.add_image_paths_arguments()
+    parser.add_model_arguments(require_model_arg=False, default_model="qwen-image-2.1")
     parser.add_lora_arguments()
+    parser.add_image_generator_arguments(supports_metadata_config=True, supports_dimension_scale_factor=True)
+    parser.set_defaults(width=None, height=None)
+    for flag in ("--width", "--height"):
+        parser._option_string_actions[flag].help = (
+            "Output size: a multiple of 32 or a reference-image scale factor (auto means 1x). "
+            "If omitted, derive from output-resolution and the last reference's aspect ratio."
+        )
+    parser.add_image_paths_arguments(required=False)
     parser.add_output_arguments()
     parser.add_argument(
-        "--mask-image",
-        type=str,
-        default=None,
-        help="Path to an inpaint mask (white = repaint, black = preserve) aligned with the first condition image.",
-    )
-    parser.add_argument(
-        "--auto-mask",
-        type=str,
-        default=None,
-        help="Describe an object to mask ('the red shirt'); the in-memory Qwen3-VL locates it. Ignored with --mask-image.",
-    )
-    parser.add_argument(
-        "--use-step-cache",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Skip unchanged transformer blocks on nearby denoising steps (faster, slightly different output).",
-    )
-    parser.add_argument(
-        "--step-cache-threshold",
-        type=float,
-        default=0.12,
-        help="Step-cache aggressiveness: higher skips more (default: 0.12).",
-    )
-    parser.add_argument(
-        "--strength",
-        type=float,
-        default=1.0,
-        help="Edit strength in (0, 1]: 1.0 fully re-denoises from noise, lower values "
-        "start from the reference partway down the schedule for subtler edits.",
-    )
-    parser.add_argument(
-        "--enhance-prompt",
-        action="store_true",
-        help="Rewrite the instruction into a detailed prompt first (official serving recipe).",
-    )
-    parser.add_argument(
-        "--verify",
-        action="store_true",
-        help="After generating, self-check the result with the built-in Qwen3-VL.",
-    )
-    parser.add_argument(
-        "--verify-retries",
+        "--output-resolution",
         type=int,
-        default=0,
-        help="Regenerate with a new seed when verification fails, at most this many times.",
+        default=1024,
+        help="Pixel-area budget for reference images and automatic output dimensions (default: 1024).",
     )
     parser.add_argument(
-        "--rgba-output",
-        action="store_true",
-        help="Keep the decoder's alpha channel and save RGBA (transparent stickers); "
-        "requires a PNG/WebP/TIFF --output.",
+        "--use-kv-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse text and reference image prefix attention across steps (default: on).",
     )
     return parser
 
 
-def validate_args(parser: CommandLineParser, args) -> None:
-    """Cheap checks that must fail BEFORE the ~33 GB model load."""
-    image_paths = args.image_paths or []
-    if not image_paths:
-        parser.error("at least one --image-paths image is required")
-    if len(image_paths) > 10:
-        parser.error(f"Qwen-Image-2.1 supports at most 10 reference images, got {len(image_paths)}")
-    missing = [p for p in image_paths if not Path(p).exists()]
-    if missing:
-        parser.error(f"condition image(s) not found: {missing}")
-    if args.mask_image is not None and not Path(args.mask_image).exists():
-        parser.error(f"--mask-image not found: {args.mask_image}")
-    if not 0.0 < args.strength <= 1.0:
-        parser.error(f"--strength must be in (0, 1], got {args.strength}")
-    if args.scheduler not in ("linear", "viggle_turbo"):
-        parser.error(
-            f"Qwen-Image-2.1 editing supports the default linear Euler scheduler or "
-            f"'viggle_turbo' (6-step distilled LoRA), got {args.scheduler!r}"
-        )
-    if args.scheduler == "viggle_turbo" and args.steps != TURBO_SIGMA_NODES:
-        parser.error(
-            f"--scheduler viggle_turbo samples the distilled LoRA on its fixed sigma nodes; "
-            f"use --steps {TURBO_SIGMA_NODES}, got {args.steps}"
-        )
-    if args.scheduler == "viggle_turbo":
-        if not args.lora_paths:
-            print(
-                "⚠️  --scheduler viggle_turbo without --lora runs the BASE model on 6 nodes; "
-                "pass the distilled adapter for turbo results."
-            )
-        if args.use_step_cache:
-            print(
-                "⚠️  --use-step-cache amortizes across nearby steps and is tuned for the 40-step "
-                "base schedule; with 6 turbo steps it can only skip the blocks it just ran. "
-                "Consider leaving it off."
-            )
-    if args.rgba_output and Path(str(args.output)).suffix.lower() not in (".png", ".webp", ".tif", ".tiff"):
-        parser.error("--rgba-output needs a PNG, WebP or TIFF --output to retain transparency.")
-    if args.guidance is not None and args.guidance < 1.0:
-        parser.error(f"--guidance must be >= 1.0, got {args.guidance}")
-    if args.steps < 1:
-        parser.error(f"--steps must be >= 1, got {args.steps}")
-    # plain-int dimensions are floored to /16 by the config; flag clearly wrong values
-    dims_specified = CommandLineParser._option_was_provided("--width", "--height")
-    if dims_specified and isinstance(args.width, int) and isinstance(args.height, int):
-        if args.width < 32 or args.height < 32:
-            parser.error(f"--width/--height must be >= 32, got {args.width}x{args.height}")
-
-
-def main():
+def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    validate_args(parser, args)
-
-    model_config = ConfigResolution.resolve_restricted(
-        args.model,
-        DEFAULT_MODEL,
-        model_path=args.model_path,
-        base_model=args.base_model,
-    )
-
-    qwen = QwenImage21Edit(
+    CommandLineParser.warn_ignored_options(IGNORED_OPTIONS)
+    if args.guidance is None or args.guidance == 1:
+        CommandLineParser.warn_ignored_options(
+            {"--negative-prompt": CONDITIONAL_OPTIONS["--negative-prompt"]["reason"]}
+        )
+    if Path(args.output).suffix.lower() not in (".png", ".webp", ".tif", ".tiff"):
+        parser.error("Qwen-Image-2.1 outputs RGBA; use PNG, WebP or TIFF to retain transparency.")
+    if args.scheduler not in ("linear", "viggle_turbo"):
+        parser.error("Qwen-Image-2.1 supports the default linear Euler scheduler or viggle_turbo only.")
+    ViggleTurboScheduler.check_args(parser, args)
+    paths = args.image_paths or []
+    if len(paths) > 10:
+        parser.error("Qwen-Image-2.1 supports at most 10 reference images.")
+    try:
+        guidance = args.guidance if args.guidance is not None else 1.0
+        if not math.isfinite(guidance) or guidance < 1:
+            raise ValueError("guidance must be finite and at least 1.")
+        width, height = args.width, args.height
+        if isinstance(width, ScaleFactor) or isinstance(height, ScaleFactor):
+            width, height = DimensionResolver.resolve(
+                width=width if width is not None else ScaleFactor(1),
+                height=height if height is not None else ScaleFactor(1),
+                reference_image_path=paths[-1] if paths else None,
+            )
+        QwenImage21LatentCreator.validate(
+            width if width is not None else 32, height if height is not None else 32, args.steps, len(paths)
+        )
+        QwenImage21LatentCreator.validate_resolution(args.output_resolution)
+        model_config = ConfigResolution.resolve_restricted(
+            args.model, "qwen-image-2.1", model_path=args.model_path, base_model=args.base_model
+        )
+    except (ModelConfigError, ValueError) as exc:
+        parser.error(str(exc))
+    model = QwenImage21Edit(
         quantize=args.quantize,
         model_path=args.model_path,
         model_config=model_config,
         **lora_init_kwargs_from_args(args),
     )
-
-    memory_saver = CallbackManager.register_callbacks(
-        args=args,
-        model=qwen,
-        latent_creator=Qwen21LatentCreator,
-    )
-
+    memory_saver = CallbackManager.register_callbacks(args, model, QwenImage21LatentCreator)
     try:
-        image_paths = [str(p) for p in args.image_paths]
-        width, height = DimensionResolver.resolve_output_dimensions(
-            args.width,
-            args.height,
-            image_paths[-1],
-            dims_specified=CommandLineParser._option_was_provided("--width", "--height"),
-        )
-
         for seed in args.seed:
-            image = qwen.generate_image(
+            image = model.generate_image(
                 seed=seed,
                 prompt=PromptUtil.read_prompt(args),
                 negative_prompt=PromptUtil.read_negative_prompt(args),
-                image_paths=image_paths,
                 width=width,
                 height=height,
-                guidance=args.guidance if args.guidance is not None else 1.0,
-                scheduler=args.scheduler,
                 num_inference_steps=args.steps,
-                mask_image=args.mask_image,
-                auto_mask=args.auto_mask,
-                use_step_cache=args.use_step_cache,
-                step_cache_threshold=args.step_cache_threshold,
-                strength=args.strength,
-                enhance_prompt=args.enhance_prompt,
-                verify=args.verify,
-                verify_retries=args.verify_retries,
-                rgba_output=args.rgba_output,
+                guidance=guidance,
+                image_paths=paths,
+                output_resolution=args.output_resolution,
+                use_kv_cache=args.use_kv_cache,
             )
-            if getattr(image, "verification", None):
-                print(f"verification: {image.verification}")
-            image.save(path=Path(args.output.format(seed=seed)), export_json_metadata=args.metadata)
+            image.save(Path(args.output.format(seed=seed)), export_json_metadata=args.metadata)
     except (StopImageGenerationException, PromptFileReadError) as exc:
         print(exc)
     finally:

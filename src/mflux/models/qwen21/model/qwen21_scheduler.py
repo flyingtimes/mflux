@@ -39,6 +39,23 @@ class ViggleTurboScheduler(BaseScheduler):
         )
         self._timesteps = mx.arange(steps, dtype=mx.float32)
 
+    @staticmethod
+    def check_args(parser, args) -> None:
+        # Runs before the model load, so a wrong --steps fails fast.
+        if args.scheduler != "viggle_turbo":
+            return
+        nodes = len(ViggleTurboScheduler.SIGMA_NODES)
+        if args.steps != nodes:
+            parser.error(
+                f"--scheduler viggle_turbo samples the distilled LoRA on its fixed sigma nodes; "
+                f"use --steps {nodes}, got {args.steps}"
+            )
+        if not args.lora_paths:
+            print(
+                "⚠️  --scheduler viggle_turbo without --lora runs the BASE model on 6 nodes; "
+                "pass the distilled adapter for turbo results."
+            )
+
     @property
     def sigmas(self) -> mx.array:
         return self._sigmas
