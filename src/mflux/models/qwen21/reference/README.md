@@ -83,7 +83,7 @@ mflux-generate-qwen-2.1-edit \
   --output edited.png
 ```
 
-Auto-mask, prompt rewriting and verification decode greedily with the text encoder's own untied `lm_head`, so they need no extra download. Checkpoints saved before this support existed lack that head; they still generate, but these three options raise an error with them.
+Auto-mask, prompt rewriting and verification decode greedily with the text encoder's own untied `lm_head`, so they need no extra download. The head is about 1.2 GB in bf16 and 0.66 GB at q8. The loader keeps it lazy and reads it only when one of these options first uses it. `save_model` still writes the head, so exports keep these options. Checkpoints saved before this support existed do not have the head. They still generate, but these three options raise an error with them.
 
 ## LoRA
 

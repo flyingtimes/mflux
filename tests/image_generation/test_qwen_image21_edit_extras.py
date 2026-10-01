@@ -40,13 +40,29 @@ class _FakeTransformer:
 
 
 class _FakeVAE:
+    def __init__(self):
+        self.encoded = []
+
     def encode(self, pixels):
         h, w = pixels.shape[2] // 16, pixels.shape[3] // 16
-        return mx.full((1, 64, 1, h, w), float(mx.mean(pixels)))
+        self.encoded.append(float(mx.mean(pixels)))
+        return mx.full((1, 64, 1, h, w), self.encoded[-1])
 
     def decode(self, latents):
         # zeros: repainted pixels come back mid-gray, preserved ones must be the source
         return mx.zeros((1, 4, 1, latents.shape[3] * 16, latents.shape[4] * 16))
+
+
+class _Recorder:
+    def __init__(self):
+        self.seeds = []
+        self.latents = None
+
+    def call_before_loop(self, seed, prompt, latents, config, **kwargs):
+        self.seeds.append(seed)
+
+    def call_in_loop(self, t, seed, prompt, latents, config, time_steps):
+        self.latents = latents
 
 
 def _stub_model(prompts=None):
@@ -105,6 +121,20 @@ def test_mask_image_repaints_only_the_white_region(tmp_path):
     np.testing.assert_allclose(pixels[32, 56], SOURCE_RGB, atol=2)  # preserved exactly
 
 
+def test_unmasked_latents_end_on_the_source(tmp_path):
+    # The final pixel composite hides the per-step blend, so check the latents directly.
+    model = _stub_model()
+    recorder = _Recorder()
+    model.callbacks.register(recorder)
+    _generate(model, tmp_path, mask_image=_left_half_mask(tmp_path))
+    # 64x64 output -> 4x4 latent grid. The model repaints the white left half (columns 0-1).
+    tokens = np.array(recorder.latents).reshape(4, 4, -1)
+    source = model.vae.encoded[-1]
+    # sigma is 0 after the final step, so unmasked tokens equal the encoded source exactly
+    np.testing.assert_array_equal(tokens[:, 2:], np.full_like(tokens[:, 2:], source))
+    assert not np.allclose(tokens[:, :2], source)
+
+
 def test_auto_mask_reads_qwen3_vl_0_1000_boxes(tmp_path):
     model = _stub_model()
     model._vision_reply = lambda instruction, images, tokens: '[{"bbox_2d": [0, 0, 500, 1000], "label": "x"}]'
@@ -151,6 +181,8 @@ def test_verify_retries_until_the_check_passes(tmp_path):
         '{"instruction_applied": true, "outside_unchanged": true}',
     ]
     model._vision_reply = lambda instruction, images, tokens: replies.pop(0)
+    recorder = _Recorder()
+    model.callbacks.register(recorder)
     image = _generate(model, tmp_path, verify=True, verify_retries=3)
     assert image.verification == {
         "verified": True,
@@ -159,6 +191,7 @@ def test_verify_retries_until_the_check_passes(tmp_path):
         "retries": 1,
     }
     assert len(model.transformer.calls) == 8  # original + one retry
+    assert recorder.seeds == [1, 2]  # the retry moves to the next seed
 
 
 def test_verify_retries_reuse_the_mask_and_rewritten_prompt(tmp_path):
@@ -329,6 +362,27 @@ def test_generation_head_is_optional_when_loading():
         Qwen21Initializer._validate_weights(
             "vae", module, {"embed.weight": mx.zeros((2, 2))}, QwenImage21WeightDefinition
         )
+
+
+def test_generation_head_stays_on_disk_until_first_use(tmp_path):
+    from mlx import nn
+
+    from mflux.models.qwen21.qwen21_initializer import Qwen21Initializer
+    from mflux.models.qwen21.reference.weights.qwen_image21_weight_definition import QwenImage21WeightDefinition
+
+    path = str(tmp_path / "head.safetensors")
+    mx.save_safetensors(path, {"lm_head": mx.ones((1024, 4096)), "embed": mx.ones((1024, 4096))})
+    mx.clear_cache()
+    weights = mx.load(path)
+    module = nn.Module()
+    module.lm_head = nn.Linear(4096, 1024, bias=False)
+    module.embed = nn.Linear(4096, 1024, bias=False)
+    module.lm_head.weight, module.embed.weight = weights.pop("lm_head"), weights.pop("embed")
+    before = mx.get_active_memory()
+    Qwen21Initializer._materialize("text_encoder", module, QwenImage21WeightDefinition)
+    assert mx.get_active_memory() - before < 20e6  # the 16 MB embed only, not the head
+    mx.eval(module.lm_head(mx.ones((1, 4096))))  # first use reads it from disk
+    assert mx.get_active_memory() - before >= 32e6
 
 
 def test_grounding_parse_bbox_reads_0_1000_coordinates():

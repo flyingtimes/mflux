@@ -70,11 +70,21 @@ class Qwen21Initializer:
             # each dense source is freed once its quantized result exists, so the peak is the
             # quantized component plus one chunk rather than dense and quantized side by side.
             del weights, supplied
-            parameters = [value for _, value in tree_flatten(module.parameters())]
-            for start in range(0, len(parameters), 8):
-                mx.eval(parameters[start : start + 8])
-            del parameters
+            Qwen21Initializer._materialize(component.name, module, weight_definition)
             mx.clear_cache()
+
+    @staticmethod
+    def _materialize(name: str, module, weight_definition) -> None:
+        # The text encoder's generation head (lm_head, ~1.2 GB bf16) serves only auto-mask,
+        # prompt rewriting and verification. Leaving it lazy defers its read and quantization
+        # to first use, so runs without those options never hold it.
+        is_generation_head = getattr(weight_definition, "is_generation_head", None)
+        deferred = is_generation_head if name == "text_encoder" else None
+        parameters = [
+            value for key, value in tree_flatten(module.parameters()) if deferred is None or not deferred(key)
+        ]
+        for start in range(0, len(parameters), 8):
+            mx.eval(parameters[start : start + 8])
 
     @staticmethod
     def apply_lora(
