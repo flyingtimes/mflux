@@ -13,15 +13,15 @@ from mflux.callbacks.callback_manager import CallbackManager
 from mflux.callbacks.callback_registry import CallbackRegistry
 from mflux.models.common.config import ModelConfig
 from mflux.models.qwen21.cli import qwen21_edit_generate as cli
-from mflux.models.qwen21.reference.model.qwen_image21_text_encoder.grounding import QwenImage21Grounding
-from mflux.models.qwen21.reference.model.qwen_image21_text_encoder.text_encoder import QwenImage21TextEncoder
-from mflux.models.qwen21.reference.model.qwen_image21_transformer.layout import QwenImage21Layout
-from mflux.models.qwen21.reference.model.qwen_image21_transformer.transformer import (
+from mflux.models.qwen21.model.qwen21_text_encoder.grounding import QwenImage21Grounding
+from mflux.models.qwen21.model.qwen21_text_encoder.text_encoder import QwenImage21TextEncoder
+from mflux.models.qwen21.model.qwen21_transformer.qwen21_layout import QwenImage21Layout
+from mflux.models.qwen21.model.qwen21_transformer.qwen_image21_transformer import (
     QwenImage21Transformer,
     StepCache,
 )
-from mflux.models.qwen21.reference.weights.qwen_image21_weight_definition import QwenImage21WeightDefinition
 from mflux.models.qwen21.variants.edit.qwen_image_21_edit import QwenImage21Edit
+from mflux.models.qwen21.weights.qwen_image21_weight_definition import QwenImage21WeightDefinition
 
 pytestmark = pytest.mark.fast
 
@@ -345,7 +345,7 @@ def test_step_cache_recomputes_once_the_signal_accumulates():
 
 def test_generation_head_is_optional_when_loading():
     from mflux.models.qwen21.qwen21_initializer import Qwen21Initializer
-    from mflux.models.qwen21.reference.weights.qwen_image21_weight_definition import QwenImage21WeightDefinition
+    from mflux.models.qwen21.weights.qwen_image21_weight_definition import QwenImage21WeightDefinition
 
     module = SimpleNamespace(
         parameters=lambda: {"lm_head": {"weight": mx.zeros((2, 2))}, "embed": {"weight": mx.zeros((2, 2))}},
@@ -368,7 +368,7 @@ def test_generation_head_stays_on_disk_until_first_use(tmp_path):
     from mlx import nn
 
     from mflux.models.qwen21.qwen21_initializer import Qwen21Initializer
-    from mflux.models.qwen21.reference.weights.qwen_image21_weight_definition import QwenImage21WeightDefinition
+    from mflux.models.qwen21.weights.qwen_image21_weight_definition import QwenImage21WeightDefinition
 
     path = str(tmp_path / "head.safetensors")
     mx.save_safetensors(path, {"lm_head": mx.ones((1024, 4096)), "embed": mx.ones((1024, 4096))})

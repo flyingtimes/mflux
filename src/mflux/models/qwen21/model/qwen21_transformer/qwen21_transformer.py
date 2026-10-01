@@ -19,7 +19,7 @@ from mflux.models.qwen21.model.qwen21_transformer.qwen21_time_text_embed import 
 from mflux.models.qwen21.model.qwen21_transformer.qwen21_transformer_block import Qwen21TransformerBlock
 
 if TYPE_CHECKING:
-    from mflux.models.qwen21.reference.model.qwen_image21_transformer.transformer import StepCache
+    from mflux.models.qwen21.model.qwen21_transformer.qwen_image21_transformer import StepCache
 
 
 class Qwen21Transformer(nn.Module):
