@@ -60,6 +60,8 @@ def _stub_model(prompts=None):
     model.callbacks = CallbackRegistry()
     model.tiling_config = None
     model.bits = None
+    model.lora_paths = None
+    model.lora_scales = None
 
     def encode(prompt, images):
         if prompts is not None:
@@ -309,19 +311,24 @@ def test_step_cache_recomputes_once_the_signal_accumulates():
 
 
 def test_generation_head_is_optional_when_loading():
-    from mflux.models.qwen21.reference.qwen_image21_initializer import QwenImage21Initializer
+    from mflux.models.qwen21.qwen21_initializer import Qwen21Initializer
+    from mflux.models.qwen21.reference.weights.qwen_image21_weight_definition import QwenImage21WeightDefinition
 
     module = SimpleNamespace(
         parameters=lambda: {"lm_head": {"weight": mx.zeros((2, 2))}, "embed": {"weight": mx.zeros((2, 2))}},
         lm_head=object(),
         language_model=SimpleNamespace(norm=object()),
     )
-    QwenImage21Initializer._validate_weights("text_encoder", module, {"embed.weight": mx.zeros((2, 2))})
+    Qwen21Initializer._validate_weights(
+        "text_encoder", module, {"embed.weight": mx.zeros((2, 2))}, QwenImage21WeightDefinition
+    )
     assert module.has_generation_head is False
     # the random head is dropped, so a re-save cannot pass it off as real weights
     assert module.lm_head is None and module.language_model.norm is None
     with pytest.raises(ValueError, match="missing"):
-        QwenImage21Initializer._validate_weights("vae", module, {"embed.weight": mx.zeros((2, 2))})
+        Qwen21Initializer._validate_weights(
+            "vae", module, {"embed.weight": mx.zeros((2, 2))}, QwenImage21WeightDefinition
+        )
 
 
 def test_grounding_parse_bbox_reads_0_1000_coordinates():

@@ -1,8 +1,13 @@
+from pathlib import Path
+
+import mlx.core as mx
+from mlx.utils import tree_flatten, tree_unflatten
+
 from mflux.callbacks.callback_registry import CallbackRegistry
 from mflux.models.common.config import ModelConfig
 from mflux.models.common.lora.mapping.lora_loader import LoRALoader
+from mflux.models.common.resolution.path_resolution import PathResolution
 from mflux.models.common.tokenizer import TokenizerLoader
-from mflux.models.common.weights.loading.loaded_weights import LoadedWeights
 from mflux.models.common.weights.loading.weight_applier import WeightApplier
 from mflux.models.common.weights.loading.weight_loader import WeightLoader
 from mflux.models.qwen21.model.qwen21_text_encoder.qwen21_text_encoder import Qwen21TextEncoder
@@ -24,11 +29,60 @@ class Qwen21Initializer:
         bake_lora: bool = True,
     ) -> None:
         path = model_path if model_path else model_config.model_name
-        Qwen21Initializer._init_config(model, model_config)
-        weights = Qwen21Initializer._load_weights(path)
+        Qwen21Initializer.init_config(model, model_config)
+        root = PathResolution.resolve(path, Qwen21WeightDefinition.get_download_patterns())
+        if root is None:
+            raise ValueError("No Qwen-Image-2.1 checkpoint path was provided.")
         Qwen21Initializer._init_tokenizers(model, path)
         Qwen21Initializer._init_models(model)
-        Qwen21Initializer._apply_weights(model, weights, quantize)
+        Qwen21Initializer.load_components(model, root, Qwen21WeightDefinition, quantize, validate=True)
+        Qwen21Initializer.apply_lora(model, lora_paths, lora_scales, bake_lora)
+
+    @staticmethod
+    def load_components(model, root: Path, weight_definition, quantize: int | None, *, validate: bool = False) -> None:
+        # Release each dense component before loading the next, especially for edit's visual encoder.
+        model.bits = None
+        for component in weight_definition.get_components():
+            module = getattr(model, component.model_attr or component.name)
+            weights = WeightLoader.load_single_local(component, root)
+            supplied = dict(tree_flatten(weights.components[component.name]))
+            if component.name == "transformer":
+                supplied = Qwen21Initializer._normalize_transformer_weights(supplied)
+                weights.components[component.name] = tree_unflatten(list(supplied.items()))
+            if validate and weights.meta_data.quantization_level is None:
+                Qwen21Initializer._validate_weights(component.name, module, supplied, weight_definition)
+            bits = WeightApplier.apply_and_quantize(
+                weights=weights,
+                models={component.name: module},
+                quantize_arg=quantize,
+                weight_definition=weight_definition,
+            )
+            if bits is not None:
+                if model.bits is not None and model.bits != bits:
+                    raise ValueError(
+                        f"Conflicting component quantization levels: {component.name} uses {bits}-bit, "
+                        f"but an earlier component uses {model.bits}-bit."
+                    )
+                model.bits = bits
+            if validate and weights.meta_data.quantization_level is not None:
+                Qwen21Initializer._validate_weights(component.name, module, supplied, weight_definition)
+            # Drop the loader's references first, then materialize a few tensors at a time:
+            # each dense source is freed once its quantized result exists, so the peak is the
+            # quantized component plus one chunk rather than dense and quantized side by side.
+            del weights, supplied
+            parameters = [value for _, value in tree_flatten(module.parameters())]
+            for start in range(0, len(parameters), 8):
+                mx.eval(parameters[start : start + 8])
+            del parameters
+            mx.clear_cache()
+
+    @staticmethod
+    def apply_lora(
+        model,
+        lora_paths: list[str] | None,
+        lora_scales: list[float] | None,
+        bake_lora: bool,
+    ) -> None:
         model.lora_paths, model.lora_scales = LoRALoader.load_and_apply_lora(
             lora_mapping=Qwen21LoRAMapping.get_mapping(),
             transformer=model.transformer,
@@ -38,18 +92,11 @@ class Qwen21Initializer:
         )
 
     @staticmethod
-    def _init_config(model, model_config: ModelConfig) -> None:
+    def init_config(model, model_config: ModelConfig) -> None:
         model.prompt_cache = {}
         model.model_config = model_config
         model.callbacks = CallbackRegistry()
         model.tiling_config = None
-
-    @staticmethod
-    def _load_weights(model_path: str) -> LoadedWeights:
-        return WeightLoader.load(
-            weight_definition=Qwen21WeightDefinition,
-            model_path=model_path,
-        )
 
     @staticmethod
     def _init_tokenizers(model, model_path: str) -> None:
@@ -65,14 +112,37 @@ class Qwen21Initializer:
         model.text_encoder = Qwen21TextEncoder()
 
     @staticmethod
-    def _apply_weights(model, weights: LoadedWeights, quantize: int | None) -> None:
-        model.bits = WeightApplier.apply_and_quantize(
-            weights=weights,
-            quantize_arg=quantize,
-            weight_definition=Qwen21WeightDefinition,
-            models={
-                "vae": model.vae,
-                "transformer": model.transformer,
-                "text_encoder": model.text_encoder,
-            },
-        )
+    def _normalize_transformer_weights(supplied: dict[str, mx.array]) -> dict[str, mx.array]:
+        normalized = {}
+        for key, value in supplied.items():
+            if key == "time_text_embed.time_proj.freqs" or key in {
+                f"pos_embed.{table}.{axis}" for table in ("cos_tables", "sin_tables") for axis in range(3)
+            }:
+                continue  # Older text-only exports included these deterministic, non-learned buffers.
+            # Saved mflux exports bypass HF mappings; include packed weights and quantization metadata.
+            target = key.replace("modulation.1.", "modulation.layers.1.", 1) if key.startswith("modulation.1.") else key
+            if target in normalized:
+                raise ValueError(f"Duplicate transformer checkpoint key after normalization: {target}")
+            normalized[target] = value
+        return normalized
+
+    @staticmethod
+    def _validate_weights(name: str, module, supplied: dict[str, mx.array], weight_definition=None) -> None:
+        expected = dict(tree_flatten(module.parameters()))
+        missing = {key for key in set(expected) - set(supplied) if not key.endswith(".inv_freq")}
+        is_generation_head = getattr(weight_definition, "is_generation_head", None)
+        if name == "text_encoder" and is_generation_head is not None:
+            head = {key for key in missing if is_generation_head(key)}
+            module.has_generation_head = not head
+            if head:
+                # Drop the unloaded head so it is neither quantized nor re-saved as random weights.
+                module.lm_head = None
+                module.language_model.norm = None
+            missing -= head
+        unexpected = set(supplied) - set(expected)
+        mismatched = [key for key in expected.keys() & supplied.keys() if expected[key].shape != supplied[key].shape]
+        if missing or unexpected or mismatched:
+            raise ValueError(
+                f"{name} checkpoint mismatch: missing={sorted(missing)}, "
+                f"unexpected={sorted(unexpected)}, shapes={mismatched}"
+            )
